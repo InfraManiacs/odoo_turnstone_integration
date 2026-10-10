@@ -1,0 +1,131 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates xml:space="preserve">
+
+<t t-name="turnstone_integration.TurnstoneLive">
+    <div class="o_turnstone_live p-3 h-100 overflow-auto">
+
+        <div class="d-flex align-items-center justify-content-between mb-2">
+            <div>
+                <h4 class="mb-0">Live Activity</h4>
+                <span class="small text-muted">
+                    Everything running on <t t-out="state.connectionName"/>, whoever started it.
+                </span>
+            </div>
+            <div class="d-flex gap-2 align-items-center">
+                <select class="form-select form-select-sm w-auto"
+                        t-on-change="(ev) => this.setFilter(ev.target.value)">
+                    <option value="">All states</option>
+                    <option value="attention">Waiting for approval</option>
+                    <option value="thinking">Working</option>
+                    <option value="idle">Idle</option>
+                    <option value="error">Error</option>
+                </select>
+                <button class="btn btn-sm"
+                        t-att-class="state.autoRefresh ? 'btn-primary' : 'btn-outline-secondary'"
+                        t-on-click="() => this.toggleAutoRefresh()">
+                    <i class="fa fa-refresh me-1" t-att-class="{ 'fa-spin': state.autoRefresh }"/>
+                    <t t-out="state.autoRefresh ? 'Live' : 'Paused'"/>
+                </button>
+            </div>
+        </div>
+
+        <div t-if="state.error" class="alert alert-danger">
+            <strong>Could not read cluster activity.</strong>
+            <div t-out="state.error"/>
+        </div>
+
+        <div t-if="state.loading" class="text-muted">Loading…</div>
+
+        <t t-else="">
+            <div t-if="state.overview" class="row g-2 mb-3">
+                <div class="col-6 col-md-2">
+                    <div class="o_ts_stat">
+                        <div class="o_ts_stat_v" t-out="state.overview.workstreams"/>
+                        <div class="o_ts_stat_l">Workstreams</div>
+                    </div>
+                </div>
+                <div class="col-6 col-md-2">
+                    <div class="o_ts_stat">
+                        <div class="o_ts_stat_v" t-out="state.overview.states.thinking"/>
+                        <div class="o_ts_stat_l">Working</div>
+                    </div>
+                </div>
+                <div class="col-6 col-md-2">
+                    <div class="o_ts_stat"
+                         t-att-class="{ 'o_ts_stat_warn': state.overview.states.attention }">
+                        <div class="o_ts_stat_v" t-out="state.overview.states.attention"/>
+                        <div class="o_ts_stat_l">Need approval</div>
+                    </div>
+                </div>
+                <div class="col-6 col-md-2">
+                    <div class="o_ts_stat"
+                         t-att-class="{ 'o_ts_stat_bad': state.overview.states.error }">
+                        <div class="o_ts_stat_v" t-out="state.overview.states.error"/>
+                        <div class="o_ts_stat_l">Errored</div>
+                    </div>
+                </div>
+                <div class="col-6 col-md-2">
+                    <div class="o_ts_stat">
+                        <div class="o_ts_stat_v" t-out="state.overview.nodes"/>
+                        <div class="o_ts_stat_l">Nodes</div>
+                    </div>
+                </div>
+                <div class="col-6 col-md-2">
+                    <div class="o_ts_stat">
+                        <div class="o_ts_stat_v" t-out="state.overview.aggregate.total_tool_calls"/>
+                        <div class="o_ts_stat_l">Tool calls</div>
+                    </div>
+                </div>
+            </div>
+
+            <div t-if="!state.rows.length" class="alert alert-info">
+                Nothing running on this Turnstone right now.
+            </div>
+
+            <table t-else="" class="table table-sm align-middle o_ts_live_table">
+                <thead>
+                    <tr>
+                        <th>Workstream</th>
+                        <th>State</th>
+                        <th>Doing</th>
+                        <th>Model</th>
+                        <th class="text-end">Tools</th>
+                        <th class="text-end">Context</th>
+                        <th/>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr t-foreach="state.rows" t-as="r" t-key="r.ws_id"
+                        t-att-class="{ 'o_ts_row_attention': r.state === 'attention' }">
+                        <td>
+                            <div t-att-style="'padding-left:' + (r.depth * 18) + 'px'">
+                                <i t-if="r.depth" class="fa fa-level-up fa-rotate-90 text-muted me-1"
+                                   title="Subagent"/>
+                                <span t-out="r.name"/>
+                                <span t-if="r.kind === 'coordinator'"
+                                      class="badge text-bg-light ms-1">coord</span>
+                                <div class="small text-muted font-monospace"
+                                     t-out="r.ws_id.slice(0, 12)"/>
+                            </div>
+                        </td>
+                        <td><span class="badge" t-att-class="this.stateBadge(r.state)" t-out="r.state"/></td>
+                        <td class="small text-muted text-truncate o_ts_doing" t-att-title="r.activity"
+                            t-out="r.activity or '—'"/>
+                        <td class="small" t-out="r.model or '—'"/>
+                        <td class="small text-end" t-out="r.tool_calls"/>
+                        <td class="small text-end" t-out="this.percent(r.context_ratio) + '%'"/>
+                        <td class="text-end">
+                            <button class="btn btn-sm btn-outline-primary py-0"
+                                    t-on-click="() => this.open(r)"
+                                    t-att-title="r.odoo_session_id ? 'Open in chat' : 'Attach to Odoo and open in chat'">
+                                <t t-out="r.odoo_session_id ? 'open' : 'attach'"/>
+                            </button>
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+        </t>
+    </div>
+</t>
+
+</templates>

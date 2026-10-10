@@ -5,6 +5,7 @@ import { registry } from "@web/core/registry";
 import { rpc } from "@web/core/network/rpc";
 import { useService } from "@web/core/utils/hooks";
 import { _t } from "@web/core/l10n/translation";
+import { renderMarkdown } from "@turnstone_integration/js/markdown";
 
 /**
  * Turnstone chat client.
@@ -37,7 +38,15 @@ export class TurnstoneChat extends Component {
             catalog: { skills: [], personas: [] },
             newSession: { connection_id: null, name: "", skill: "", persona: "" },
             showTools: true,
+            children: [],
+            showChildren: false,
+            adoptWsId: "",
+            isManager: false,
         });
+
+        // Rendered markdown is cached per message id + body so a poll that
+        // changes nothing does not re-parse the whole transcript every 2s.
+        this._mdCache = new Map();
 
         this.threadRef = useRef("thread");
         this.pollHandle = null;
@@ -79,6 +88,7 @@ export class TurnstoneChat extends Component {
         this.state.connections = res.connections || [];
         this.state.sessions = res.sessions || [];
         this.state.showTools = res.show_tool_calls !== false;
+        this.state.isManager = !!res.is_manager;
         this.pollInterval = res.poll_interval || 2000;
         this.state.newSession.connection_id =
             (this.state.connections.find((c) => c.is_default) || this.state.connections[0])?.id ??
@@ -93,7 +103,23 @@ export class TurnstoneChat extends Component {
             return this.fail(res.error);
         }
         this.state.session = res.session;
+        this.loadChildren();
         this.maybePoll();
+    }
+
+    /**
+     * Subagents, read off the synced session rather than fetched separately.
+     *
+     * They are persisted server-side during sync precisely because Turnstone's
+     * live feed drops a child once it finishes — fetching live here would make
+     * the panel count up and then empty itself.
+     */
+    loadChildren() {
+        const s = this.state.session;
+        this.state.children = (s && s.subagents) || [];
+        if (this.state.children.length) {
+            this.state.showChildren = true;
+        }
     }
 
     /** Poll only while the agent is actually working. */
@@ -116,6 +142,7 @@ export class TurnstoneChat extends Component {
             }
             this.state.session = res.session;
             await this.refreshSidebar();
+            this.loadChildren();
             this.maybePoll();
         }, this.pollInterval);
     }
@@ -239,6 +266,58 @@ export class TurnstoneChat extends Component {
         this.stopPolling();
     }
 
+    async retry() {
+        const res = await rpc("/turnstone/session/retry", {
+            session_id: this.state.session.id,
+        });
+        if (res.error) {
+            return this.fail(res.error);
+        }
+        this.state.session = res.session;
+        this.maybePoll();
+    }
+
+    async rewind(turns = 1) {
+        const res = await rpc("/turnstone/session/rewind", {
+            session_id: this.state.session.id,
+            turns,
+        });
+        if (res.error) {
+            return this.fail(res.error);
+        }
+        this.state.session = res.session;
+    }
+
+    /** Attach to a workstream started outside Odoo — a scheduled run, say. */
+    async adopt(wsId) {
+        const id = (wsId || this.state.adoptWsId || "").trim();
+        if (!id) {
+            return;
+        }
+        const res = await rpc("/turnstone/session/adopt", {
+            connection_id:
+                this.state.session?.connection_id || this.state.newSession.connection_id,
+            ws_id: id,
+        });
+        if (res.error) {
+            return this.fail(res.error);
+        }
+        this.state.session = res.session;
+        this.state.sessions = res.sessions || this.state.sessions;
+        this.state.adoptWsId = "";
+        this.loadChildren();
+        this.maybePoll();
+    }
+
+    /** Open a subagent: adopt it if Odoo has never seen it, else just switch. */
+    async openChild(child) {
+        if (child.odoo_session_id) {
+            await this.openSession(child.odoo_session_id);
+        } else {
+            await this.adopt(child.ws_id);
+        }
+    }
+
     /** Jump to an Odoo record the agent created or updated. */
     openLinkedRecord(link) {
         this.action.doAction({
@@ -261,6 +340,32 @@ export class TurnstoneChat extends Component {
     }
 
     // -- presentation --------------------------------------------------------
+
+    /** Agent output is markdown; render it rather than making users read it raw. */
+    renderBody(message) {
+        const key = message.id + ":" + message.body.length;
+        if (!this._mdCache.has(key)) {
+            this._mdCache.set(key, renderMarkdown(message.body));
+            // The cache is per-session-view and transcripts are rewritten
+            // wholesale on rewind, so bound it rather than let it grow.
+            if (this._mdCache.size > 400) {
+                this._mdCache.delete(this._mdCache.keys().next().value);
+            }
+        }
+        return this._mdCache.get(key);
+    }
+
+    stateBadge(state) {
+        return {
+            done: "text-bg-light",
+            draft: "text-bg-secondary",
+            idle: "text-bg-success",
+            thinking: "text-bg-info",
+            attention: "text-bg-warning",
+            error: "text-bg-danger",
+            closed: "text-bg-secondary",
+        }[state] || "text-bg-secondary";
+    }
 
     stateLabel(state) {
         return {

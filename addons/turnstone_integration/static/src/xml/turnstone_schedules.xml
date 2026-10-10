@@ -62,14 +62,22 @@
                             </div>
                             <table t-else="" class="table table-sm mb-0">
                                 <thead>
-                                    <tr><th>Started</th><th>Status</th><th>Workstream</th></tr>
+                                    <tr><th>Started</th><th>Status</th><th>Workstream</th><th/></tr>
                                 </thead>
                                 <tbody>
                                     <tr t-foreach="state.runs" t-as="r" t-key="r.run_id or r_index">
                                         <td class="small" t-out="r.started or r.created or '—'"/>
                                         <td class="small" t-out="r.status or r.state or '—'"/>
                                         <td class="small font-monospace"
-                                            t-out="r.ws_id or '—'"/>
+                                            t-out="(r.ws_id or r.workstream_id or '—')"/>
+                                        <td class="text-end">
+                                            <button t-if="r.ws_id or r.workstream_id"
+                                                    class="btn btn-sm btn-outline-primary py-0"
+                                                    t-on-click="() => this.openRun(r)"
+                                                    title="Open this run's transcript in the chat">
+                                                open
+                                            </button>
+                                        </td>
                                     </tr>
                                 </tbody>
                             </table>

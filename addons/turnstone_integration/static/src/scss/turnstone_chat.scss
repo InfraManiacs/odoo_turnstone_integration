@@ -67,3 +67,102 @@
         overflow-y: auto;
     }
 }
+
+// Markdown rendered from agent output. Scoped tightly so agent text cannot
+// restyle the surrounding Odoo chrome even if it emits a class we also use.
+.o_turnstone_chat .o_ts_md {
+    white-space: normal;   // the renderer emits real block elements now
+
+    > :first-child { margin-top: 0; }
+    > :last-child { margin-bottom: 0; }
+
+    p { margin-bottom: .5rem; }
+
+    .o_ts_h {
+        font-weight: 600;
+        margin: .75rem 0 .35rem;
+        &:first-child { margin-top: 0; }
+    }
+    h3.o_ts_h { font-size: 1.05rem; }
+    h4.o_ts_h { font-size: 1rem; }
+    h5.o_ts_h, h6.o_ts_h { font-size: .95rem; }
+
+    code {
+        background-color: rgba(0, 0, 0, .06);
+        padding: .1rem .3rem;
+        border-radius: .2rem;
+        font-size: .875em;
+    }
+
+    pre.o_ts_code {
+        background-color: rgba(0, 0, 0, .06);
+        padding: .5rem .7rem;
+        border-radius: .3rem;
+        overflow-x: auto;
+        margin-bottom: .5rem;
+
+        code { background: none; padding: 0; }
+    }
+
+    .o_ts_quote {
+        border-left: 3px solid rgba(0, 0, 0, .15);
+        padding-left: .6rem;
+        margin: .4rem 0;
+        color: var(--bs-secondary-color, #6c757d);
+    }
+
+    ul, ol { margin-bottom: .5rem; padding-left: 1.25rem; }
+    li { margin-bottom: .15rem; }
+
+    // Wide agent tables scroll inside the bubble rather than stretching it.
+    .o_ts_table_wrap { overflow-x: auto; margin-bottom: .5rem; }
+    .o_ts_table {
+        margin-bottom: 0;
+        font-size: .875rem;
+        th { white-space: nowrap; }
+        td { vertical-align: top; }
+    }
+
+    hr { margin: .6rem 0; opacity: .25; }
+}
+
+.o_turnstone_chat {
+    .o_ts_activity {
+        font-style: italic;
+    }
+
+    .o_ts_children {
+        max-height: 14rem;
+        overflow-y: auto;
+        background-color: rgba(0, 0, 0, .02);
+    }
+
+    .o_ts_child {
+        border-bottom: 1px solid rgba(0, 0, 0, .05);
+        &:last-child { border-bottom: 0; }
+    }
+}
+
+.o_turnstone_live {
+    .o_ts_stat {
+        border: 1px solid rgba(0, 0, 0, .08);
+        border-radius: .4rem;
+        padding: .5rem .75rem;
+        background-color: rgba(0, 0, 0, .02);
+
+        &.o_ts_stat_warn { border-color: var(--bs-warning, #ffc107); }
+        &.o_ts_stat_bad { border-color: var(--bs-danger, #dc3545); }
+    }
+    .o_ts_stat_v { font-size: 1.4rem; font-weight: 600; line-height: 1.1; }
+    .o_ts_stat_l { font-size: .75rem; text-transform: uppercase; opacity: .65; }
+
+    .o_ts_doing { max-width: 28ch; }
+
+    .o_ts_row_attention { background-color: rgba(255, 193, 7, .12); }
+}
+
+// A finished subagent stays listed — the record of what ran is the point —
+// but reads as history rather than as something still happening.
+.o_turnstone_chat .o_ts_child_done {
+    opacity: .6;
+}

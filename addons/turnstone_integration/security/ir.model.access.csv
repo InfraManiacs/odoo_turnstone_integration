@@ -7,3 +7,5 @@ access_turnstone_message_user,turnstone.message user,model_turnstone_message,gro
 access_turnstone_message_manager,turnstone.message manager,model_turnstone_message,group_turnstone_manager,1,1,1,1
 access_turnstone_linked_record_user,turnstone.linked.record user,model_turnstone_linked_record,group_turnstone_user,1,0,0,0
 access_turnstone_linked_record_manager,turnstone.linked.record manager,model_turnstone_linked_record,group_turnstone_manager,1,1,1,1
+access_turnstone_subagent_user,turnstone.subagent user,model_turnstone_subagent,group_turnstone_user,1,0,0,0
+access_turnstone_subagent_manager,turnstone.subagent manager,model_turnstone_subagent,group_turnstone_manager,1,1,1,1

@@ -48,6 +48,22 @@
                 <button class="btn btn-sm btn-primary w-100" t-on-click="() => this.createSession()">
                     Start
                 </button>
+
+                <!-- Joining work that already exists in Turnstone: a scheduled
+                     run, or anything started outside Odoo. -->
+                <div class="mt-3 pt-2 border-top">
+                    <label class="form-label small mb-1">Attach to a running job</label>
+                    <div class="input-group input-group-sm">
+                        <input type="text" class="form-control" placeholder="workstream id"
+                               t-model="state.adoptWsId"/>
+                        <button class="btn btn-outline-secondary"
+                                t-att-disabled="!state.adoptWsId.trim()"
+                                t-on-click="() => this.adopt()">Attach</button>
+                    </div>
+                    <div t-if="state.isManager" class="form-text small">
+                        Find ids under Turnstone → Live Activity.
+                    </div>
+                </div>
             </div>
 
             <div class="o_ts_session_list flex-grow-1 overflow-auto">
@@ -108,10 +124,29 @@
                             </t>
                         </span>
                     </div>
-                    <div class="d-flex gap-1">
+                    <div class="d-flex gap-1 align-items-center">
+                        <span t-if="state.session.kind === 'coordinator'"
+                              class="badge text-bg-info" title="Delegates to spawned subagents">
+                            coordinator
+                        </span>
+                        <span t-if="state.session.adopted" class="badge text-bg-secondary"
+                              title="Started outside Odoo and attached here">attached</span>
                         <button t-if="state.session.state === 'thinking'"
                                 class="btn btn-sm btn-outline-secondary"
-                                t-on-click="() => this.cancelGeneration()">Stop</button>
+                                t-on-click="() => this.cancelGeneration()"
+                                title="Stop the turn in flight">Stop</button>
+                        <button t-if="state.session.state === 'idle'"
+                                class="btn btn-sm btn-outline-secondary"
+                                t-on-click="() => this.retry()"
+                                title="Re-run the last message for a different answer">
+                            <i class="fa fa-repeat"/>
+                        </button>
+                        <button t-if="state.session.state === 'idle'"
+                                class="btn btn-sm btn-outline-secondary"
+                                t-on-click="() => this.rewind(1)"
+                                title="Drop the last turn and take another route">
+                            <i class="fa fa-undo"/>
+                        </button>
                         <button class="btn btn-sm btn-outline-secondary"
                                 t-on-click="() => this.closeSession()">Close</button>
                     </div>
@@ -140,13 +175,19 @@
                                 <div class="o_ts_role small text-muted mb-1">
                                     <t t-out="m.role === 'user' ? 'You' : 'Agent'"/>
                                 </div>
-                                <div class="o_ts_body" t-out="m.body"/>
+                                <!-- renderBody returns markup() built escape-first;
+                                     see static/src/js/markdown.js -->
+                                <div class="o_ts_body o_ts_md" t-out="this.renderBody(m)"/>
                             </div>
                         </t>
                     </div>
 
-                    <div t-if="state.session.state === 'thinking'" class="text-muted small">
-                        <i class="fa fa-circle-o-notch fa-spin me-1"/>Working…
+                    <div t-if="state.session.state === 'thinking'" class="text-muted small o_ts_activity">
+                        <i class="fa fa-circle-o-notch fa-spin me-1"/>
+                        <t t-if="state.session.activity">
+                            <t t-out="state.session.activity"/>
+                        </t>
+                        <t t-else="">Working…</t>
                     </div>
                 </div>
 
@@ -163,6 +204,43 @@
                                 t-on-click="() => this.resolveApproval(true)">Approve</button>
                         <button class="btn btn-sm btn-outline-danger"
                                 t-on-click="() => this.resolveApproval(false)">Deny</button>
+                    </div>
+                </div>
+
+                <!-- Subagents. A coordinator delegates; this is where the work
+                     actually happens, so it needs to be visible and reachable. -->
+                <div t-if="state.children.length" class="o_ts_children border-top">
+                    <div class="d-flex align-items-center justify-content-between px-2 pt-2">
+                        <span class="small text-muted">
+                            <i class="fa fa-sitemap me-1"/>
+                            Subagents (<t t-out="state.children.length"/>)
+                        </span>
+                        <button class="btn btn-sm btn-link py-0"
+                                t-on-click="() => state.showChildren = !state.showChildren">
+                            <t t-out="state.showChildren ? 'hide' : 'show'"/>
+                        </button>
+                    </div>
+                    <div t-if="state.showChildren" class="px-2 pb-2">
+                        <div t-foreach="state.children" t-as="c" t-key="c.ws_id"
+                             class="o_ts_child d-flex align-items-center gap-2 py-1"
+                             t-att-class="{ 'o_ts_child_done': c.gone }"
+                             t-att-style="'margin-left:' + ((c.depth - 1) * 16) + 'px'">
+                            <span class="badge" t-att-class="this.stateBadge(c.state)"
+                                  t-out="c.state"/>
+                            <span class="text-truncate flex-grow-1" t-att-title="c.activity">
+                                <t t-out="c.name"/>
+                                <span t-if="c.activity" class="text-muted small ms-1"
+                                      t-out="c.activity"/>
+                            </span>
+                            <span class="small text-muted" t-if="c.tool_calls">
+                                <t t-out="c.tool_calls"/> tools
+                            </span>
+                            <button class="btn btn-sm btn-outline-primary py-0"
+                                    t-on-click="() => this.openChild(c)"
+                                    t-att-title="c.odoo_session_id ? 'Open this subagent' : 'Attach and open this subagent'">
+                                <t t-out="c.odoo_session_id ? 'open' : 'attach'"/>
+                            </button>
+                        </div>
                     </div>
                 </div>
 

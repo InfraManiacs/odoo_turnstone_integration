@@ -62,6 +62,29 @@ class TurnstoneSession(models.Model):
         default="draft", readonly=True, index=True,
     )
     node_id = fields.Char(readonly=True, help="Turnstone node hosting this session.")
+    kind = fields.Selection(
+        [("interactive", "Interactive"), ("coordinator", "Coordinator")],
+        default="interactive", readonly=True,
+        help="Interactive sessions run tools themselves. Coordinators delegate to "
+             "spawned children — a scheduled job is usually one of these.",
+    )
+    parent_ws_id = fields.Char(
+        readonly=True, index=True,
+        help="Set when Turnstone spawned this session as a child of another.",
+    )
+    activity = fields.Char(
+        readonly=True, help="What the agent is doing right now, as Turnstone reports it.",
+    )
+    activity_state = fields.Char(readonly=True)
+    adopted = fields.Boolean(
+        readonly=True,
+        help="Attached to a workstream that already existed in Turnstone — a "
+             "scheduled run, or work started outside Odoo — rather than started here.",
+    )
+    has_queued_message = fields.Boolean(
+        readonly=True,
+        help="A message is waiting behind the turn currently in flight.",
+    )
     tool_call_count = fields.Integer(readonly=True)
     token_count = fields.Integer(readonly=True)
     context_ratio = fields.Float(
@@ -70,6 +93,8 @@ class TurnstoneSession(models.Model):
     last_activity = fields.Datetime(default=fields.Datetime.now, readonly=True)
 
     message_ids = fields.One2many("turnstone.message", "session_id")
+    subagent_ids = fields.One2many("turnstone.subagent", "session_id")
+    subagent_count = fields.Integer(compute="_compute_subagent_count")
     linked_record_ids = fields.One2many("turnstone.linked.record", "session_id")
     linked_record_count = fields.Integer(compute="_compute_linked_record_count")
 
@@ -84,6 +109,14 @@ class TurnstoneSession(models.Model):
         for rec in self:
             rec.has_pending_approval = bool(rec.pending_approval_json and
                                             rec.pending_approval_json != "[]")
+
+    def _compute_subagent_count(self):
+        data = self.env["turnstone.subagent"]._read_group(
+            [("session_id", "in", self.ids)], ["session_id"], ["__count"]
+        )
+        counts = {s.id: n for s, n in data}
+        for rec in self:
+            rec.subagent_count = counts.get(rec.id, 0)
 
     def _compute_linked_record_count(self):
         data = self.env["turnstone.linked.record"]._read_group(
@@ -150,7 +183,7 @@ class TurnstoneSession(models.Model):
         if not self.ws_id:
             self._ensure_started(first_message=body)
         else:
-            self.connection_id._client().send(self.ws_id, body)
+            self.connection_id._client().send(self.ws_id, body, kind=self.kind)
 
         self.sudo().write({"state": "thinking", "last_activity": fields.Datetime.now()})
         return self.sync_from_server()
@@ -169,16 +202,43 @@ class TurnstoneSession(models.Model):
         except (ValueError, AttributeError, IndexError):
             cycle_id = None
         self.connection_id._client().approve(
-            self.ws_id, approved, feedback=feedback, cycle_id=cycle_id
+            self.ws_id, approved, feedback=feedback, cycle_id=cycle_id, kind=self.kind
         )
         self.sudo().write({"state": "thinking", "pending_approval_json": "[]"})
+        return self.sync_from_server()
+
+    def action_retry(self):
+        """Re-run the last user turn. Useful when an agent went down a wrong path."""
+        self.ensure_one()
+        self._check_owner()
+        if not self.ws_id:
+            raise UserError(_("This session has not started."))
+        self.connection_id._client().retry(self.ws_id, kind=self.kind)
+        self.sudo().write({"state": "thinking"})
+        return self.sync_from_server()
+
+    def action_rewind(self, turns=1):
+        """Drop the last N turns, so the conversation can take another route."""
+        self.ensure_one()
+        self._check_owner()
+        if not self.ws_id:
+            raise UserError(_("This session has not started."))
+        self.connection_id._client().rewind(self.ws_id, turns=turns, kind=self.kind)
+        return self.sync_from_server()
+
+    def action_cancel_queued(self):
+        """Drop a message queued behind the in-flight turn, leaving the turn alone."""
+        self.ensure_one()
+        self._check_owner()
+        if self.ws_id:
+            self.connection_id._client().cancel_queued(self.ws_id, kind=self.kind)
         return self.sync_from_server()
 
     def action_cancel_generation(self):
         self.ensure_one()
         self._check_owner()
         if self.ws_id:
-            self.connection_id._client().cancel(self.ws_id)
+            self.connection_id._client().cancel(self.ws_id, kind=self.kind)
         return self.sync_from_server()
 
     def action_close(self):
@@ -186,7 +246,7 @@ class TurnstoneSession(models.Model):
         self._check_owner()
         if self.ws_id:
             try:
-                self.connection_id._client().close(self.ws_id)
+                self.connection_id._client().close(self.ws_id, kind=self.kind)
             except UserError:
                 # Already gone server-side; closing locally is still correct.
                 _logger.info("Turnstone close failed for %s; closing locally", self.ws_id)
@@ -217,8 +277,16 @@ class TurnstoneSession(models.Model):
             "tool_call_count": live.get("tool_calls") or 0,
             "token_count": live.get("tokens") or 0,
             "context_ratio": live.get("context_ratio") or 0.0,
+            "activity": live.get("activity") or False,
+            "activity_state": live.get("activity_state") or False,
             "last_activity": fields.Datetime.now(),
         }
+        if persisted.get("kind"):
+            vals["kind"] = persisted["kind"]
+        if persisted.get("parent_ws_id"):
+            vals["parent_ws_id"] = persisted["parent_ws_id"]
+        if persisted.get("persona") and not self.persona:
+            vals["persona"] = persisted["persona"]
         # Turnstone titles a session from its first turn; adopt that once, so
         # the sidebar shows something better than "New session".
         title = persisted.get("title") or live.get("title")
@@ -230,7 +298,40 @@ class TurnstoneSession(models.Model):
         self.sudo().write(vals)
         self._sync_messages(messages)
         self._sync_linked_records(messages)
+        self._sync_subagents()
         return self._as_dict()
+
+    def _sync_subagents(self):
+        """Upsert the children currently visible, and mark the rest finished."""
+        self.ensure_one()
+        live = self._children()
+        Sub = self.env["turnstone.subagent"].sudo()
+        existing = {s.ws_id: s for s in self.sudo().subagent_ids}
+        seen = set()
+        for child in live:
+            seen.add(child["ws_id"])
+            vals = {
+                "name": child["name"],
+                "state": child["state"],
+                "kind": child["kind"],
+                "persona": child.get("persona"),
+                "model_alias": child.get("model"),
+                "activity": child.get("activity"),
+                "tool_call_count": child.get("tool_calls") or 0,
+                "token_count": child.get("tokens") or 0,
+                "depth": child.get("depth") or 1,
+                "parent_ws_id": child.get("parent_ws_id"),
+                "gone": False,
+            }
+            if child["ws_id"] in existing:
+                existing[child["ws_id"]].write(vals)
+            else:
+                Sub.create(dict(vals, session_id=self.id, ws_id=child["ws_id"]))
+        # Anything we knew about that is no longer listed has finished. Keep the
+        # row and its last known numbers; only the liveness flag changes.
+        for ws_id, rec in existing.items():
+            if ws_id not in seen and not rec.gone:
+                rec.write({"gone": True, "activity": False})
 
     @staticmethod
     def _map_state(raw):
@@ -422,6 +523,127 @@ class TurnstoneSession(models.Model):
                 ids.add(int(text))
         return sorted(ids)
 
+    # -- subagents ---------------------------------------------------------
+
+    def _children(self):
+        """Child workstreams Turnstone spawned from this session.
+
+        Read off the cluster feed rather than /workstreams/{id}/children: that
+        endpoint is coordinator-only and answers "coordinator not found" for an
+        interactive session, whereas every row of the cluster feed carries
+        parent_ws_id.
+        """
+        self.ensure_one()
+        if not self.ws_id:
+            return []
+        try:
+            feed = self.connection_id._client().cluster_workstreams(per_page=200)
+        except UserError:
+            # Subagents are a nicety; a chat that still works beats an error
+            # banner because one extra call failed.
+            _logger.info("Could not read cluster feed for children of %s", self.ws_id)
+            return []
+        rows = feed.get("workstreams") or []
+        by_parent = {}
+        for row in rows:
+            by_parent.setdefault(row.get("parent_ws_id"), []).append(row)
+
+        # Walk the tree so a child that spawned its own children is reachable.
+        out, queue, seen = [], list(by_parent.get(self.ws_id) or []), set()
+        depth = {c.get("id"): 1 for c in queue}
+        while queue:
+            row = queue.pop(0)
+            rid = row.get("id")
+            if not rid or rid in seen:
+                continue
+            seen.add(rid)
+            out.append({
+                "ws_id": rid,
+                "name": row.get("title") or row.get("name") or rid[:12],
+                "state": row.get("state"),
+                "kind": row.get("kind"),
+                "activity": row.get("activity") or "",
+                "model": row.get("model_alias") or row.get("model"),
+                "tool_calls": row.get("tool_calls") or 0,
+                "tokens": row.get("tokens") or 0,
+                "persona": row.get("persona"),
+                "depth": depth.get(rid, 1),
+                "parent_ws_id": row.get("parent_ws_id"),
+            })
+            for grandchild in by_parent.get(rid) or []:
+                depth[grandchild.get("id")] = depth.get(rid, 1) + 1
+                queue.append(grandchild)
+        return out
+
+    # -- adoption ----------------------------------------------------------
+
+    @api.model
+    def adopt(self, connection_id, ws_id, name=None):
+        """Attach to a workstream that already exists in Turnstone.
+
+        This is how a user joins work they did not start from Odoo — a
+        scheduled run, a job kicked off by another system, or a child spawned by
+        a coordinator. The conversation is already there; this just gives it an
+        Odoo record so it can be opened, steered and access-controlled.
+        """
+        conn = self.env["turnstone.connection"].browse(int(connection_id)).exists()
+        if not conn:
+            raise UserError(_("No such Turnstone server."))
+        conn._check_user_allowed()
+        self._check_may_adopt(conn, ws_id)
+
+        existing = self.search([("ws_id", "=", ws_id), ("connection_id", "=", conn.id)], limit=1)
+        if existing:
+            existing._check_owner()
+            existing.sync_from_server()
+            return existing
+
+        detail = conn._client().session_detail(ws_id)
+        persisted = detail.get("persisted") or {}
+        if not persisted.get("ws_id"):
+            raise UserError(_("Turnstone has no workstream %s.") % ws_id)
+
+        session = self.create({
+            "name": name or persisted.get("title") or persisted.get("name") or _("Adopted session"),
+            "connection_id": conn.id,
+            "ws_id": ws_id,
+            "adopted": True,
+            "kind": persisted.get("kind") or "interactive",
+            "parent_ws_id": persisted.get("parent_ws_id") or False,
+            "persona": persisted.get("persona") or False,
+            "node_id": persisted.get("node_id") or False,
+        })
+        session.sync_from_server()
+        return session
+
+    @api.model
+    def _check_may_adopt(self, connection, ws_id):
+        """Guard adoption. Knowing a workstream id must not be enough.
+
+        Adopting hands over the whole transcript, and a transcript contains
+        whatever the agent read — with the SERVER token's authority, not the
+        caller's. Without this check any Turnstone User could attach to another
+        person's chat, or to an unattended scheduled job, just by passing its id.
+
+        Managers may adopt anything; that is what the Live Activity view is for.
+        Everyone else may adopt only a workstream Turnstone already told us is a
+        descendant of a session they own — the "open my subagent" case. Those
+        rows exist only because the user's own session synced them.
+        """
+        if self.env.user.has_group("turnstone_integration.group_turnstone_manager"):
+            return True
+        own_subagent = self.env["turnstone.subagent"].sudo().search([
+            ("ws_id", "=", ws_id),
+            ("session_id.connection_id", "=", connection.id),
+            ("session_id.user_id", "=", self.env.user.id),
+        ], limit=1)
+        if own_subagent:
+            return True
+        raise AccessError(
+            _("You can only attach to a subagent of one of your own sessions. "
+              "Ask a Turnstone Administrator to attach this workstream for you.")
+        )
+
     # -- serialisation for the chat client ---------------------------------
 
     def _as_dict(self):
@@ -442,6 +664,11 @@ class TurnstoneSession(models.Model):
             "connection_id": rec.connection_id.id,
             "connection_name": rec.connection_id.name,
             "node_id": rec.node_id or None,
+            "kind": rec.kind,
+            "parent_ws_id": rec.parent_ws_id or None,
+            "adopted": rec.adopted,
+            "activity": rec.activity or "",
+            "activity_state": rec.activity_state or "",
             "tool_calls": rec.tool_call_count,
             "tokens": rec.token_count,
             "context_ratio": rec.context_ratio,
@@ -456,6 +683,19 @@ class TurnstoneSession(models.Model):
                     "is_guard_notice": m.is_guard_notice,
                 }
                 for m in rec.message_ids
+            ],
+            "subagents": [
+                {
+                    "ws_id": sub.ws_id,
+                    "name": sub.name or sub.ws_id[:12],
+                    "state": "done" if sub.gone else (sub.state or "unknown"),
+                    "kind": sub.kind,
+                    "activity": sub.activity or "",
+                    "tool_calls": sub.tool_call_count,
+                    "depth": sub.depth,
+                    "gone": sub.gone,
+                }
+                for sub in rec.subagent_ids
             ],
             "linked_records": [
                 {

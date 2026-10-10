@@ -26,6 +26,13 @@
               sequence="20"
               groups="turnstone_integration.group_turnstone_user"/>
 
+    <menuitem id="menu_turnstone_live"
+              name="Live Activity"
+              parent="menu_turnstone_root"
+              action="action_turnstone_live"
+              sequence="30"
+              groups="turnstone_integration.group_turnstone_manager"/>
+
     <menuitem id="menu_turnstone_config"
               name="Configuration"
               parent="menu_turnstone_root"

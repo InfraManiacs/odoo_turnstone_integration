@@ -10,15 +10,25 @@ asking Turnstone over its HTTP API.
 
 ## What it gives you
 
-- **Agent Chat** — an OWL client action for talking to Turnstone agents.
+- **Agent Chat** — an OWL client action for talking to Turnstone agents, with
+  agent output rendered as Markdown rather than dumped as raw text.
 - **Tool approvals in-line** — an agent that stops for a human stops here, with
   the tool name, its arguments and any judge verdict shown. Approve or deny
   without leaving Odoo.
+- **Subagents** — when a coordinator spawns children, they appear nested with
+  live state and tool counts, and each can be opened in its own chat.
+- **Steering** — stop a turn in flight, retry the last message, rewind a turn,
+  or queue a message while the agent is still working.
+- **Attach to running work** — join a workstream that was started outside Odoo:
+  a scheduled run, a job from another system, or a subagent.
+- **Live Activity** — what the whole Turnstone cluster is doing right now,
+  nested parent/child, with the stuck and waiting ones first.
 - **Linked records** — when an agent writes to Odoo through the Odoo MCP server,
   the session shows what it created or changed and links straight to it.
 - **Sessions as Odoo records** — searchable, groupable, access-controlled like
   anything else.
-- **Scheduled jobs** — read-only view of Turnstone's cron tasks and run history.
+- **Scheduled jobs** — Turnstone's cron tasks and run history, and a run can be
+  opened to see exactly what that firing did.
 - **Multiple servers** — connect to more than one Turnstone, with per-connection
   group restrictions.
 
@@ -43,8 +53,8 @@ under-scoped.
 
 | Group | Can |
 |---|---|
-| Turnstone / **User** | Chat, and see **only their own** sessions |
-| Turnstone / **Administrator** | Configure servers, hold API tokens, see **every** session |
+| Turnstone / **User** | Chat, see **only their own** sessions, and attach to subagents **of their own sessions** |
+| Turnstone / **Administrator** | Configure servers, hold API tokens, see **every** session, use Live Activity, attach to **any** workstream |
 
 Administrator is a real privilege, not just a config role: a transcript contains
 whatever the agent read, and the agent reads with the **server token's**
@@ -54,8 +64,14 @@ Per-connection `allowed_group_ids` narrows access further. It can only narrow �
 Turnstone User is still required.
 
 Verified against a non-manager user: cannot see others' sessions, cannot read
-`api_token`, cannot write connections, and cannot drive another user's session
-through the controllers.
+`api_token`, cannot write connections, cannot drive another user's session
+through the controllers, cannot open Live Activity or Schedules, and **cannot
+attach to a workstream that is not a subagent of a session they own**.
+
+That last one matters more than it looks. Attaching hands over a whole
+transcript, and a transcript contains whatever the agent read — using the
+**server token's** authority, not the caller's. Knowing a workstream id must not
+be enough to read it.
 
 ## Design notes
 
@@ -79,6 +95,29 @@ returns the persisted row, the live block and the message tail together.
 **The transcript is replaced, not appended.** Turnstone can rewind or retry a
 turn, which removes messages. Diffing an append-only mirror against a mutable
 source is how you end up showing a reply that was taken back.
+
+**Coordinators and interactive sessions are driven through different APIs.**
+A coordinator is hosted by the console (`/workstreams/{id}/...`); an interactive
+session lives on a node and is reached through the routing proxy
+(`/route/workstreams/{id}/...`). Using the wrong one does not degrade: the proxy
+returns HTTP 404 for a coordinator and the console returns
+`{"error": "coordinator not found"}` for an interactive session. Every
+per-session call therefore takes the session's `kind`.
+
+**Subagents are persisted, not read live.** They are discovered from Turnstone's
+cluster feed via `parent_ws_id` — `/workstreams/{id}/children` is coordinator-only
+and 404s otherwise — but that feed lists only workstreams Turnstone still holds.
+A child that finishes drops out of it, so reading live makes the subagent panel
+count up to two and then empty itself. Each sync upserts what it sees and marks
+the rest finished, because "two subagents ran and both completed" is the useful
+answer.
+
+**Agent output is rendered escape-first.** `static/src/js/markdown.js` escapes
+every character before any transform runs, so the only markup in the output is
+markup it wrote; DOMPurify (already bundled by `web`) runs as a second,
+independent layer. This text is written by a model that reads untrusted input —
+pod logs, email bodies, web pages — so "the agent would not emit a script tag"
+is not a security argument.
 
 **Linked records are parsed from the transcript**, because the agent's writes
 reach Odoo over JSON-RPC through the Odoo MCP server — Odoo has no idea they came
@@ -125,12 +164,21 @@ database password and mounts the addon read-write.
 
 ## Status
 
-Working and exercised end to end against a live Turnstone: bootstrap, catalog,
-session create, send, transcript mirroring, and an agent reply that ran real
-tools.
+Exercised end to end against a live Turnstone, including:
+
+- chat with an agent that ran real cluster tools and answered
+- adopting a coordinator started **outside** Odoo, watching it spawn two
+  subagents, approving its tool call from Odoo, and reading the final answer
+- Live Activity listing 19 workstreams across the cluster, correctly marking
+  which ones Odoo already knows
+- the permission matrix above, as a non-manager user
 
 Not yet done:
 - The agent-writes-to-Odoo round trip is tested against synthetic transcripts
-  rather than a live Odoo MCP server pointed at this instance.
+  rather than a live Odoo MCP server pointed at this instance — the cluster
+  cannot reach a laptop.
 - Polling, not streaming. Turnstone exposes SSE; this polls while an agent works.
-- No tests directory yet.
+- No automated test suite; the verification above was driven by hand.
+- The UI has not been looked at in a browser — the Chrome extension was not
+  connected during development. Templates are cross-checked against components
+  statically, which catches unresolved references but not layout.

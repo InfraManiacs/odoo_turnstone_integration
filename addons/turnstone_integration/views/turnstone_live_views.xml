@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="action_turnstone_live" model="ir.actions.client">
+        <field name="name">Live Activity</field>
+        <field name="tag">turnstone_integration.live</field>
+    </record>
+</odoo>

@@ -213,6 +213,127 @@ class TurnstoneController(http.Controller):
         except (UserError, AccessError) as exc:
             return self._error(exc)
 
+    @http.route("/turnstone/session/retry", type="jsonrpc", auth="user")
+    def session_retry(self, session_id):
+        try:
+            session = self._session(session_id)
+            session.check_access("write")
+            return {"session": session.action_retry()}
+        except (UserError, AccessError) as exc:
+            return self._error(exc)
+
+    @http.route("/turnstone/session/rewind", type="jsonrpc", auth="user")
+    def session_rewind(self, session_id, turns=1):
+        try:
+            session = self._session(session_id)
+            session.check_access("write")
+            return {"session": session.action_rewind(turns=turns)}
+        except (UserError, AccessError) as exc:
+            return self._error(exc)
+
+    @http.route("/turnstone/session/cancel_queued", type="jsonrpc", auth="user")
+    def session_cancel_queued(self, session_id):
+        try:
+            session = self._session(session_id)
+            session.check_access("write")
+            return {"session": session.action_cancel_queued()}
+        except (UserError, AccessError) as exc:
+            return self._error(exc)
+
+    @http.route("/turnstone/session/children", type="jsonrpc", auth="user")
+    def session_children(self, session_id):
+        """Subagents this session spawned."""
+        try:
+            session = self._session(session_id)
+            children = session._children()
+            # Which of them already have an Odoo record, so the UI can offer
+            # "open" rather than "attach" where it applies.
+            known = {
+                s.ws_id: s.id
+                for s in request.env["turnstone.session"].search(
+                    [("ws_id", "in", [c["ws_id"] for c in children])]
+                )
+            }
+            for child in children:
+                child["odoo_session_id"] = known.get(child["ws_id"])
+            return {"children": children}
+        except (UserError, AccessError) as exc:
+            return self._error(exc)
+
+    @http.route("/turnstone/session/adopt", type="jsonrpc", auth="user")
+    def session_adopt(self, connection_id, ws_id, name=None):
+        """Join a workstream that already exists in Turnstone."""
+        try:
+            self._require_user()
+            session = request.env["turnstone.session"].adopt(connection_id, ws_id, name=name)
+            return {"session": session._as_dict(), "sessions": self._session_list()}
+        except (UserError, AccessError) as exc:
+            return self._error(exc)
+
+    # -- live cluster view -------------------------------------------------
+
+    @http.route("/turnstone/live", type="jsonrpc", auth="user")
+    def live(self, connection_id=None, state=None):
+        """What Turnstone is doing right now, across the whole cluster.
+
+        Manager-only. The feed covers every workstream on the server regardless
+        of who started it, including scheduled jobs and work from other systems,
+        and a session name alone can disclose what another team is working on.
+        Ordinary users get their own sessions through /turnstone/bootstrap.
+        """
+        try:
+            if not request.env.user.has_group(
+                "turnstone_integration.group_turnstone_manager"
+            ):
+                raise AccessError(
+                    _("Only Turnstone Administrators can see cluster-wide activity.")
+                )
+            Connection = request.env["turnstone.connection"]
+            conn = (
+                Connection.browse(int(connection_id)).exists()
+                if connection_id
+                else Connection._default_for_user()
+            )
+            if not conn:
+                raise UserError(_("No such Turnstone server."))
+            client = conn._client()
+            overview = client.cluster_overview()
+            feed = client.cluster_workstreams(state=state, per_page=200)
+            rows = feed.get("workstreams") or []
+
+            known = {
+                s.ws_id: s.id
+                for s in request.env["turnstone.session"].sudo().search(
+                    [("ws_id", "in", [r.get("id") for r in rows if r.get("id")])]
+                )
+            }
+            return {
+                "connection_id": conn.id,
+                "connection_name": conn.name,
+                "overview": overview,
+                "workstreams": [
+                    {
+                        "ws_id": r.get("id"),
+                        "name": r.get("title") or r.get("name") or (r.get("id") or "")[:12],
+                        "state": r.get("state"),
+                        "kind": r.get("kind"),
+                        "parent_ws_id": r.get("parent_ws_id"),
+                        "activity": r.get("activity") or "",
+                        "activity_state": r.get("activity_state") or "",
+                        "model": r.get("model_alias") or r.get("model"),
+                        "persona": r.get("persona"),
+                        "tokens": r.get("tokens") or 0,
+                        "tool_calls": r.get("tool_calls") or 0,
+                        "context_ratio": r.get("context_ratio") or 0,
+                        "node": r.get("node"),
+                        "odoo_session_id": known.get(r.get("id")),
+                    }
+                    for r in rows
+                ],
+            }
+        except (UserError, AccessError) as exc:
+            return self._error(exc)
+
     # -- schedules ---------------------------------------------------------
 
     @http.route("/turnstone/schedules", type="jsonrpc", auth="user")

@@ -160,6 +160,21 @@ class TurnstoneClient:
             payload["initial_message"] = initial_message
         return self._request("POST", "/route/workstreams/new", payload, timeout=LONG_TIMEOUT)
 
+    # THE CONSOLE API AND THE NODE API ARE NOT THE SAME SURFACE.
+    #
+    # A coordinator is hosted by the console, and its send/approve/cancel/close
+    # live at /workstreams/{id}/...  An interactive session lives on whichever
+    # node the rendezvous hash placed it on, and is reached through the console's
+    # routing proxy at /route/workstreams/{id}/...
+    #
+    # Using the wrong one does not degrade gracefully: the route proxy answers
+    # HTTP 404 for a coordinator, and the console answers
+    # {"error": "coordinator not found"} for an interactive session. So every
+    # per-session call takes the session's kind and picks the prefix.
+    @staticmethod
+    def _ws_prefix(kind):
+        return "/workstreams" if kind == "coordinator" else "/route/workstreams"
+
     def session_detail(self, ws_id):
         """Persisted row + live block + message tail, for any session on any node.
 
@@ -169,21 +184,62 @@ class TurnstoneClient:
         """
         return self._request("GET", "/cluster/ws/%s/detail" % ws_id)
 
-    def send(self, ws_id, message):
+    def send(self, ws_id, message, kind=None):
         return self._request(
-            "POST", "/route/workstreams/%s/send" % ws_id, {"message": message}
+            "POST", "%s/%s/send" % (self._ws_prefix(kind), ws_id), {"message": message}
         )
 
-    def approve(self, ws_id, approved, feedback=None, cycle_id=None):
+    def approve(self, ws_id, approved, feedback=None, cycle_id=None, kind=None):
         payload = {"approved": bool(approved)}
         if feedback:
             payload["feedback"] = feedback
         if cycle_id:
             payload["cycle_id"] = cycle_id
-        return self._request("POST", "/route/workstreams/%s/approve" % ws_id, payload)
+        return self._request(
+            "POST", "%s/%s/approve" % (self._ws_prefix(kind), ws_id), payload
+        )
 
-    def cancel(self, ws_id):
-        return self._request("POST", "/route/workstreams/%s/cancel" % ws_id, {})
+    def cancel(self, ws_id, kind=None):
+        return self._request("POST", "%s/%s/cancel" % (self._ws_prefix(kind), ws_id), {})
 
-    def close(self, ws_id):
-        return self._request("POST", "/route/workstreams/%s/close" % ws_id, {})
+    def cancel_queued(self, ws_id, kind=None):
+        """Drop a message queued behind an in-flight turn, without killing the turn."""
+        return self._request("DELETE", "%s/%s/send" % (self._ws_prefix(kind), ws_id), {})
+
+    def retry(self, ws_id, kind=None):
+        """Re-send the last user message for a fresh answer."""
+        return self._request("POST", "%s/%s/retry" % (self._ws_prefix(kind), ws_id), {},
+                             timeout=LONG_TIMEOUT)
+
+    def rewind(self, ws_id, turns=1, kind=None):
+        """Drop the last N conversation turns."""
+        return self._request("POST", "%s/%s/rewind" % (self._ws_prefix(kind), ws_id),
+                             {"turns": int(turns)})
+
+    # -- cluster-wide visibility -------------------------------------------
+
+    def cluster_overview(self):
+        """Node count, workstream states, aggregate tokens and tool calls."""
+        return self._request("GET", "/cluster/overview")
+
+    def cluster_workstreams(self, state=None, search=None, page=1, per_page=100):
+        """Every workstream on the cluster, whoever started it.
+
+        This is also how child workstreams are found. Turnstone's
+        /workstreams/{id}/children is a COORDINATOR-only endpoint and answers
+        "coordinator not found" for an interactive session, but every row here
+        carries parent_ws_id, so the parent/child tree can be reconstructed for
+        any kind of session.
+        """
+        params = {"page": page, "per_page": per_page}
+        if state:
+            params["state"] = state
+        if search:
+            params["search"] = search
+        data = self._request("GET", "/cluster/workstreams", params=params)
+        if isinstance(data, list):
+            return {"workstreams": data, "total": len(data)}
+        return data
+
+    def close(self, ws_id, kind=None):
+        return self._request("POST", "%s/%s/close" % (self._ws_prefix(kind), ws_id), {})

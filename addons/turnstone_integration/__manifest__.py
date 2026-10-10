@@ -37,6 +37,7 @@ controllers, which call Turnstone server-side.
         "views/turnstone_connection_views.xml",
         "views/turnstone_session_views.xml",
         "views/turnstone_schedule_views.xml",
+        "views/turnstone_live_views.xml",
         "views/res_config_settings_views.xml",
         "views/turnstone_menus.xml",
     ],

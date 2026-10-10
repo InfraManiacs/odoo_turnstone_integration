@@ -21,6 +21,7 @@ export class TurnstoneSchedules extends Component {
 
     setup() {
         this.notification = useService("notification");
+        this.action = useService("action");
         this.state = useState({
             loading: true,
             error: null,
@@ -40,6 +41,34 @@ export class TurnstoneSchedules extends Component {
                 this.state.connectionId = res.connection_id;
             }
             this.state.loading = false;
+        });
+    }
+
+    /**
+     * Open the workstream a scheduled run produced.
+     *
+     * This is the whole point of showing runs: a job fired at 06:00 with nobody
+     * watching, and the question is what it did. Attaching it gives the full
+     * transcript, its subagents, and anything it touched in Odoo.
+     */
+    async openRun(run) {
+        const wsId = run.ws_id || run.workstream_id;
+        if (!wsId) {
+            this.notification.add(_t("That run recorded no workstream."), { type: "warning" });
+            return;
+        }
+        const res = await rpc("/turnstone/session/adopt", {
+            connection_id: this.state.connectionId,
+            ws_id: wsId,
+        });
+        if (res.error) {
+            this.notification.add(res.error, { type: "danger", title: _t("Turnstone") });
+            return;
+        }
+        this.action.doAction({
+            type: "ir.actions.client",
+            tag: "turnstone_integration.chat",
+            params: { session_id: res.session.id },
         });
     }
 

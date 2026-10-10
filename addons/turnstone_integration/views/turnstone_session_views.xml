@@ -12,6 +12,8 @@
                 <field name="connection_id"/>
                 <field name="skill"/>
                 <field name="state" widget="badge"/>
+                <field name="kind"/>
+                <field name="subagent_count" string="Subagents"/>
                 <field name="linked_record_count" string="Odoo records"/>
                 <field name="last_activity"/>
                 <button name="action_open_chat" type="object" string="Open" icon="fa-comments"/>
@@ -46,6 +48,10 @@
                             <field name="node_id"/>
                         </group>
                         <group string="Agent">
+                            <field name="kind"/>
+                            <field name="adopted"/>
+                            <field name="activity"/>
+                            <field name="parent_ws_id" invisible="not parent_ws_id"/>
                             <field name="skill"/>
                             <field name="persona"/>
                             <field name="model_alias"/>
@@ -62,6 +68,21 @@
                                     <field name="role"/>
                                     <field name="tool_names" string="Tools"/>
                                     <field name="body"/>
+                                </list>
+                            </field>
+                        </page>
+                        <page string="Subagents" name="subagents"
+                              invisible="subagent_count == 0">
+                            <field name="subagent_count" invisible="1"/>
+                            <field name="subagent_ids" readonly="1">
+                                <list>
+                                    <field name="depth" string="Lvl"/>
+                                    <field name="name"/>
+                                    <field name="state"/>
+                                    <field name="gone" string="Finished"/>
+                                    <field name="tool_call_count" string="Tools"/>
+                                    <field name="token_count" string="Tokens"/>
+                                    <field name="ws_id" string="Workstream"/>
                                 </list>
                             </field>
                         </page>
