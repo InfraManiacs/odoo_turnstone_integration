@@ -36,7 +36,7 @@ export class TurnstoneChat extends Component {
             sending: false,
             showNewForm: false,
             catalog: { skills: [], personas: [] },
-            newSession: { connection_id: null, name: "", skill: "", persona: "" },
+            newSession: { connection_id: null, name: "", skill: "", persona: "", kind: "interactive" },
             showTools: true,
             children: [],
             showChildren: false,
@@ -342,6 +342,24 @@ export class TurnstoneChat extends Component {
         }
     }
 
+    /**
+     * Follow the skill's own kind when one is picked.
+     *
+     * Turnstone tags every skill interactive or coordinator, and getting this
+     * wrong does not fail loudly: ask an interactive session to fan out and it
+     * has no spawn_* tools, so it explains that it cannot delegate and quietly
+     * does the work itself in one session. That is a worse outcome than an
+     * error, because it looks like it worked.
+     */
+    onSkillChange() {
+        const skill = this.state.catalog.skills.find(
+            (s) => s.name === this.state.newSession.skill
+        );
+        if (skill && (skill.kind === "coordinator" || skill.kind === "interactive")) {
+            this.state.newSession.kind = skill.kind;
+        }
+    }
+
     async createSession() {
         const n = this.state.newSession;
         const res = await rpc("/turnstone/session/new", {
@@ -349,6 +367,7 @@ export class TurnstoneChat extends Component {
             name: n.name || undefined,
             skill: n.skill || undefined,
             persona: n.persona || undefined,
+            kind: n.kind,
         });
         if (res.error) {
             return this.fail(res.error);

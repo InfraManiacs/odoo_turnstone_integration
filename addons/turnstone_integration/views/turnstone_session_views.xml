@@ -48,7 +48,7 @@
                             <field name="node_id"/>
                         </group>
                         <group string="Agent">
-                            <field name="kind"/>
+                            <field name="kind" readonly="ws_id != False"/>
                             <field name="adopted"/>
                             <field name="activity"/>
                             <field name="parent_ws_id" invisible="not parent_ws_id"/>

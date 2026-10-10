@@ -81,11 +81,19 @@ bearer credential for a harness that can reach Odoo, a Kubernetes cluster and
 anything else its MCP servers expose — in the browser it would hand every chat
 user the full authority of the server token regardless of their Odoo groups.
 
-**Sessions are created against the route endpoint, not the console one.**
-`POST /v1/api/workstreams/new` only ever creates `coordinator` sessions, which
-delegate to spawned children instead of running tools themselves. Only
-`POST /v1/api/route/workstreams/new` accepts `kind`, so the client asks for
-`interactive`.
+**The console/route split applies to session CREATION too.** Turnstone states it
+outright: *"coordinator workstreams must be created on the console via
+POST /v1/api/workstreams/new"*. So coordinators go to the console, which only
+ever makes coordinators and takes no `kind`; interactive sessions go to
+`POST /v1/api/route/workstreams/new`, the only surface that accepts `kind`. The
+console create endpoint takes no `model`, so a coordinator runs on the node
+default — its children can still be given one.
+
+**The new-session form asks which kind you want**, defaulting to the chosen
+skill's own kind. This is not a nicety: ask an interactive session to fan out
+and it has no `spawn_*` tools, so it explains that it cannot delegate and
+quietly does the work in a single session instead. That looks like success,
+which is worse than an error.
 
 **An interactive session's history is not on the console.** It lives on whichever
 node the rendezvous hash placed it on, so `/workstreams/{id}/history` returns

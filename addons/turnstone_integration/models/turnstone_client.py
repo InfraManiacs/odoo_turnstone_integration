@@ -117,7 +117,16 @@ class TurnstoneClient:
     # -- catalogue ---------------------------------------------------------
 
     def skills(self):
-        data = self._request("GET", "/skills")
+        """Skills, from the ADMIN endpoint rather than /skills.
+
+        The public summary endpoint omits `kind`, and kind is the one field
+        that actually matters when starting a session: a coordinator skill run
+        as an interactive session has no spawn_* tools, so it cannot delegate —
+        and fails by quietly doing the work in one session instead of erroring.
+        The controller trims this down to name/description/kind before it
+        reaches the browser.
+        """
+        data = self._request("GET", "/admin/skills")
         return data if isinstance(data, list) else data.get("skills", [])
 
     def personas(self):
@@ -139,25 +148,40 @@ class TurnstoneClient:
 
     def create_session(self, name=None, skill=None, persona=None, model=None,
                        initial_message=None, kind="interactive"):
-        """Start a workstream.
+        """Start a workstream, on whichever surface owns that kind.
 
-        Deliberately the ROUTE endpoint, not /workstreams/new. The console
-        endpoint only ever creates `coordinator` sessions, which delegate work
-        to spawned children instead of running tools themselves — fine for
-        orchestration, wrong for a chat window. Only the route endpoint accepts
-        `kind`.
+        The console/route split applies to CREATION too, and Turnstone is
+        explicit about it:
+
+            coordinator workstreams must be created on the console via
+            POST /v1/api/workstreams/new (with admin.coordinator scope)
+
+        So coordinators go to the console, which only ever makes coordinators
+        and therefore takes no `kind`. Interactive sessions go to the routing
+        proxy, which is the only surface that accepts `kind` — the console
+        would silently hand back a coordinator instead.
+
+        The console create endpoint takes no `model`, so a coordinator runs on
+        the node's default alias. Its children can still be given one, by the
+        coordinator itself.
         """
-        payload = {"kind": kind, "client_type": "web"}
+        payload = {}
         if name:
             payload["name"] = name
         if skill:
             payload["skill"] = skill
         if persona:
             payload["persona"] = persona
-        if model:
-            payload["model"] = model
         if initial_message:
             payload["initial_message"] = initial_message
+
+        if kind == "coordinator":
+            return self._request("POST", "/workstreams/new", payload, timeout=LONG_TIMEOUT)
+
+        payload["kind"] = "interactive"
+        payload["client_type"] = "web"
+        if model:
+            payload["model"] = model
         return self._request("POST", "/route/workstreams/new", payload, timeout=LONG_TIMEOUT)
 
     # THE CONSOLE API AND THE NODE API ARE NOT THE SAME SURFACE.

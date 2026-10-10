@@ -166,7 +166,8 @@ class TurnstoneController(http.Controller):
     # -- sessions ----------------------------------------------------------
 
     @http.route("/turnstone/session/new", type="jsonrpc", auth="user")
-    def session_new(self, connection_id=None, name=None, skill=None, persona=None, model=None):
+    def session_new(self, connection_id=None, name=None, skill=None, persona=None,
+                    model=None, kind=None):
         try:
             self._require_user()
             Connection = request.env["turnstone.connection"]
@@ -178,12 +179,15 @@ class TurnstoneController(http.Controller):
             if not conn:
                 raise UserError(_("No such Turnstone server."))
             conn._check_user_allowed()
+            if kind not in ("interactive", "coordinator"):
+                kind = "interactive"
             session = request.env["turnstone.session"].create({
                 "name": name or _("New session"),
                 "connection_id": conn.id,
                 "skill": skill or False,
                 "persona": persona or False,
                 "model_alias": model or False,
+                "kind": kind,
             })
             # The workstream itself is created lazily on the first message, so
             # opening the composer and changing your mind costs nothing on the

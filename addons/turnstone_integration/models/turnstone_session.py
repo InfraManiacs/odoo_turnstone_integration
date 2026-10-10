@@ -64,9 +64,14 @@ class TurnstoneSession(models.Model):
     node_id = fields.Char(readonly=True, help="Turnstone node hosting this session.")
     kind = fields.Selection(
         [("interactive", "Interactive"), ("coordinator", "Coordinator")],
-        default="interactive", readonly=True,
-        help="Interactive sessions run tools themselves. Coordinators delegate to "
-             "spawned children — a scheduled job is usually one of these.",
+        default="interactive", required=True,
+        help="Chosen when the session starts, and fixed once the workstream exists.\n\n"
+             "Interactive: one session that runs the tools itself. This is the right "
+             "default for asking an agent to do something.\n\n"
+             "Coordinator: delegates to spawned child sessions and synthesises their "
+             "results. Needed for fan-out work. A coordinator has spawn_* and "
+             "wait_for_workstream but NOT the MCP tools, so it cannot touch the "
+             "cluster or Odoo itself — its children do that.",
     )
     parent_ws_id = fields.Char(
         readonly=True, index=True,
@@ -157,6 +162,7 @@ class TurnstoneSession(models.Model):
             persona=self.persona or conn.sudo().default_persona or None,
             model=self.model_alias or conn.sudo().default_model or None,
             initial_message=first_message,
+            kind=self.kind or "interactive",
         )
         self.sudo().write({
             "ws_id": result.get("ws_id"),

@@ -30,11 +30,31 @@
                 </div>
                 <div class="mb-2" t-if="state.catalog.skills.length">
                     <label class="form-label small mb-1">Skill</label>
-                    <select class="form-select form-select-sm" t-model="state.newSession.skill">
+                    <select class="form-select form-select-sm" t-model="state.newSession.skill"
+                            t-on-change="() => this.onSkillChange()">
                         <option value="">Server default</option>
                         <option t-foreach="state.catalog.skills" t-as="s" t-key="s.name"
-                                t-att-value="s.name" t-att-title="s.description" t-out="s.name"/>
+                                t-att-value="s.name" t-att-title="s.description"
+                                t-out="s.name + (s.kind === 'coordinator' ? ' (coordinator)' : '')"/>
                     </select>
+                </div>
+
+                <!-- Choosing this wrong fails quietly: an interactive session
+                     asked to fan out has no spawn_* tools, so it explains that
+                     it cannot delegate and does the work itself instead. -->
+                <div class="mb-2">
+                    <label class="form-label small mb-1">Type</label>
+                    <select class="form-select form-select-sm" t-model="state.newSession.kind">
+                        <option value="interactive">Interactive — one agent does the work</option>
+                        <option value="coordinator">Coordinator — delegates to subagents</option>
+                    </select>
+                    <div class="form-text small" t-if="state.newSession.kind === 'coordinator'">
+                        Spawns child sessions and synthesises their results. The
+                        coordinator itself has no cluster or Odoo tools — its children do.
+                    </div>
+                    <div class="form-text small" t-else="">
+                        The usual choice. Pick Coordinator only for fan-out work.
+                    </div>
                 </div>
                 <div class="mb-2" t-if="state.catalog.personas.length">
                     <label class="form-label small mb-1">Persona</label>
