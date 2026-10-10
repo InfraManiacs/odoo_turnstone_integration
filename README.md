@@ -39,6 +39,38 @@ asking Turnstone over its HTTP API.
 - **Multiple servers** — connect to more than one Turnstone, with per-connection
   group restrictions.
 
+## Skills and personas are picked, not typed
+
+Each connection caches Turnstone's catalogue as `turnstone.skill` and
+`turnstone.persona` records, so every skill and persona field is a dropdown.
+Press **Sync Catalogue** on the server (a successful **Test Connection** does it
+too). Typos used to become silent misconfiguration — Turnstone answers
+"Skill not found or disabled" at session-start, long after whoever typed it
+moved on.
+
+The cache is never the source of truth. A skill that disappears upstream is
+marked unavailable rather than deleted, so an agent still points at something
+recognisable instead of quietly losing its configuration.
+
+The lists are filtered by session kind, and a mismatch is refused outright:
+a coordinator skill on an interactive agent has no spawn tools, so it would
+explain that it cannot delegate and then do the work in one session — which
+looks like success.
+
+### Why an agent has one skill, not several
+
+Verified against 1.8.3, because the API is ambiguous about it. Both create
+endpoints declare `skill` as a **string**. Passing a list is accepted with no
+error and then **silently ignored**: the workstream comes back with
+`skill_id: ""` and `skill_version: 0` — no skill at all. A comma-separated
+string is at least honest about it (`Skill not found or disabled:
+kube-sre,market-snapshot`).
+
+So one skill is the real contract. An agent can still reach further skills at
+runtime through Turnstone's own `skills` tool, which every skill here is
+registered for (`activation: named`) — that is Turnstone's mechanism for it,
+and not something this module can compose up front.
+
 ## Agents and access
 
 An administrator defines an agent once under **Turnstone → Agents**; users pick

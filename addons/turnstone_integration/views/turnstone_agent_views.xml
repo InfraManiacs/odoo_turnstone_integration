@@ -9,8 +9,8 @@
                 <field name="sequence" widget="handle"/>
                 <field name="name"/>
                 <field name="kind"/>
-                <field name="skill"/>
-                <field name="persona"/>
+                <field name="skill_id"/>
+                <field name="persona_id"/>
                 <field name="model_alias"/>
                 <field name="auto_approve"/>
                 <field name="group_ids" widget="many2many_tags" string="Restricted to"/>
@@ -45,8 +45,15 @@
                         <group string="Agent">
                             <field name="connection_id"/>
                             <field name="kind"/>
-                            <field name="skill" placeholder="kube-sre"/>
-                            <field name="persona" placeholder="avware-sre"/>
+                            <field name="skill_id" options="{'no_create': True}"
+                                   context="{'default_connection_id': connection_id}"/>
+                            <field name="skill_kind" invisible="1"/>
+                            <field name="persona_id" options="{'no_create': True}"/>
+                            <div colspan="2" class="text-muted small"
+                                 invisible="skill_id">
+                                No skills listed? Open the server under Configuration and
+                                press <b>Sync Catalogue</b>.
+                            </div>
                             <field name="model_alias" placeholder="agentic-coder"
                                    invisible="kind == 'coordinator'"/>
                             <div colspan="2" class="text-muted small"

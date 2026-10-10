@@ -72,9 +72,9 @@
                     <select class="form-select form-select-sm" t-model="state.newSession.skill"
                             t-on-change="() => this.onSkillChange()">
                         <option value="">Server default</option>
-                        <option t-foreach="state.catalog.skills" t-as="s" t-key="s.name"
+                        <option t-foreach="this.skillChoices" t-as="s" t-key="s.name"
                                 t-att-value="s.name" t-att-title="s.description"
-                                t-out="s.name + (s.kind === 'coordinator' ? ' (coordinator)' : '')"/>
+                                t-out="s.name"/>
                     </select>
                 </div>
 
@@ -83,7 +83,8 @@
                      it cannot delegate and does the work itself instead. -->
                 <div class="mb-2">
                     <label class="form-label small mb-1">Type</label>
-                    <select class="form-select form-select-sm" t-model="state.newSession.kind">
+                    <select class="form-select form-select-sm" t-model="state.newSession.kind"
+                            t-on-change="() => this.onKindChange()">
                         <option value="interactive">Interactive — one agent does the work</option>
                         <option value="coordinator">Coordinator — delegates to subagents</option>
                     </select>
@@ -99,7 +100,7 @@
                     <label class="form-label small mb-1">Persona</label>
                     <select class="form-select form-select-sm" t-model="state.newSession.persona">
                         <option value="">Default</option>
-                        <option t-foreach="state.catalog.personas" t-as="p" t-key="p.name"
+                        <option t-foreach="this.personaChoices" t-as="p" t-key="p.name"
                                 t-att-value="p.name" t-att-title="p.description"
                                 t-out="p.display_name"/>
                     </select>

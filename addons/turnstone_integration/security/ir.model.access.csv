@@ -13,3 +13,7 @@ access_turnstone_agent_user,turnstone.agent user,model_turnstone_agent,group_tur
 access_turnstone_agent_manager,turnstone.agent manager,model_turnstone_agent,group_turnstone_manager,1,1,1,1
 access_turnstone_audit_user,turnstone.audit.log user,model_turnstone_audit_log,group_turnstone_user,1,0,0,0
 access_turnstone_audit_manager,turnstone.audit.log manager,model_turnstone_audit_log,group_turnstone_manager,1,0,0,0
+access_turnstone_skill_user,turnstone.skill user,model_turnstone_skill,group_turnstone_user,1,0,0,0
+access_turnstone_skill_manager,turnstone.skill manager,model_turnstone_skill,group_turnstone_manager,1,1,1,1
+access_turnstone_persona_user,turnstone.persona user,model_turnstone_persona,group_turnstone_user,1,0,0,0
+access_turnstone_persona_manager,turnstone.persona manager,model_turnstone_persona,group_turnstone_manager,1,1,1,1

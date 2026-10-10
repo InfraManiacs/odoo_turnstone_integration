@@ -364,6 +364,39 @@ export class TurnstoneChat extends Component {
      * does the work itself in one session. That is a worse outcome than an
      * error, because it looks like it worked.
      */
+    /**
+     * Skills Turnstone will actually expose to the selected kind.
+     *
+     * Offering a coordinator skill to an interactive session is how you get a
+     * silent failure, so it is simply not in the list.
+     */
+    get skillChoices() {
+        const kind = this.state.newSession.kind;
+        return (this.state.catalog.skills || []).filter(
+            (s) => !s.kind || s.kind === "any" || s.kind === kind
+        );
+    }
+
+    get personaChoices() {
+        const kind = this.state.newSession.kind;
+        return (this.state.catalog.personas || []).filter(
+            (p) => !p.applies_to_kinds || p.applies_to_kinds.includes(kind)
+        );
+    }
+
+    /** Clear a skill that the new kind would not accept. */
+    onKindChange() {
+        if (!this.skillChoices.some((s) => s.name === this.state.newSession.skill)) {
+            this.state.newSession.skill = "";
+        }
+        if (!this.personaChoices.some((p) => p.name === this.state.newSession.persona)) {
+            this.state.newSession.persona = "";
+        }
+        if (this.state.newSession.kind === "coordinator") {
+            this.state.newSession.model = "";
+        }
+    }
+
     onSkillChange() {
         const skill = this.state.catalog.skills.find(
             (s) => s.name === this.state.newSession.skill

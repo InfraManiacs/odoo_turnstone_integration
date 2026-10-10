@@ -51,14 +51,26 @@ class TurnstoneAgent(models.Model):
              "results. Required for fan-out work, and the only kind that accepts "
              "file attachments.",
     )
-    skill = fields.Char(
-        help="Turnstone skill name. Leave empty for the server's default.",
+    # ONE skill, not many. Verified against 1.8.3: the create endpoints declare
+    # `skill` as a string, and passing a list is accepted and then SILENTLY
+    # IGNORED — the workstream comes back with skill_id "" and skill_version 0,
+    # i.e. no skill at all and no error. An agent can still pick up further
+    # skills at runtime through the `skills` tool; that is Turnstone's mechanism
+    # for it, and it is not something this module can compose up front.
+    skill_id = fields.Many2one(
+        "turnstone.skill", string="Skill", ondelete="restrict",
+        domain="[('connection_id', '=', connection_id), ('available', '=', True), "
+               "'|', ('kind', '=', False), ('kind', 'in', [kind, 'any'])]",
+        help="Leave empty for the server's default. The list is filtered to "
+             "skills Turnstone exposes to this session kind.",
     )
-    skill_kind = fields.Char(
-        readonly=True,
-        help="The kind Turnstone tags this skill with, fetched when it was chosen.",
+    skill = fields.Char(compute="_compute_catalog_names", store=True)
+    skill_kind = fields.Selection(related="skill_id.kind", readonly=True)
+    persona_id = fields.Many2one(
+        "turnstone.persona", string="Persona", ondelete="restrict",
+        domain="[('connection_id', '=', connection_id), ('available', '=', True)]",
     )
-    persona = fields.Char(help="Persona slug.")
+    persona = fields.Char(compute="_compute_catalog_names", store=True)
     model_alias = fields.Char(
         string="Model",
         help="Gateway model alias, e.g. agentic-coder or dixie-flatline. Empty "
@@ -103,6 +115,40 @@ class TurnstoneAgent(models.Model):
         "unique(name, company_id)",
         "An agent with that name already exists for this company.",
     )
+
+    @api.depends("skill_id.name", "persona_id.name")
+    def _compute_catalog_names(self):
+        """The strings actually sent to Turnstone.
+
+        Stored so that a catalogue sync which loses a row cannot silently blank
+        what this agent has been starting sessions with.
+        """
+        for rec in self:
+            rec.skill = rec.skill_id.name or False
+            rec.persona = rec.persona_id.name or False
+
+    @api.onchange("connection_id")
+    def _onchange_connection(self):
+        if self.skill_id and self.skill_id.connection_id != self.connection_id:
+            self.skill_id = False
+        if self.persona_id and self.persona_id.connection_id != self.connection_id:
+            self.persona_id = False
+
+    @api.constrains("skill_id", "kind")
+    def _check_skill_kind(self):
+        """A coordinator skill on an interactive session fails quietly.
+
+        It has no spawn_* tools, so it explains that it cannot delegate and does
+        the work in one session instead — which looks like success.
+        """
+        for rec in self:
+            sk = rec.skill_id
+            if sk and sk.kind and sk.kind != "any" and sk.kind != rec.kind:
+                raise UserError(_(
+                    "The skill %(skill)s is a %(skill_kind)s skill, but this agent is "
+                    "%(kind)s. Turnstone would not give it the right tools, and the "
+                    "mismatch fails quietly rather than erroring."
+                ) % {"skill": sk.name, "skill_kind": sk.kind, "kind": rec.kind})
 
     def _compute_session_count(self):
         data = self.env["turnstone.session"]._read_group(

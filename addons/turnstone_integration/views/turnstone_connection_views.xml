@@ -11,6 +11,7 @@
                 <field name="base_url"/>
                 <field name="is_default"/>
                 <field name="session_count" string="Sessions"/>
+                <field name="skill_count" string="Skills"/>
                 <field name="status_ok" string="Reachable" widget="boolean_toggle" readonly="1"/>
                 <field name="company_id" groups="base.group_multi_company"/>
             </list>
@@ -25,6 +26,9 @@
                 <header>
                     <button name="action_test_connection" type="object" string="Test Connection"
                             class="btn-primary"/>
+                    <button name="action_sync_catalog" type="object" string="Sync Catalogue"
+                            help="Pull skills and personas from Turnstone so they can be picked
+                                  from a list instead of typed."/>
                 </header>
                 <sheet>
                     <div class="oe_button_box" name="button_box">
@@ -47,9 +51,10 @@
                             <field name="company_id" groups="base.group_multi_company"/>
                         </group>
                         <group string="Defaults for new sessions">
-                            <field name="default_skill" placeholder="kube-sre"/>
-                            <field name="default_persona" placeholder="avware-sre"/>
+                            <field name="default_skill_id" options="{'no_create': True}"/>
+                            <field name="default_persona_id" options="{'no_create': True}"/>
                             <field name="default_model" placeholder="agentic-coder"/>
+                            <field name="catalog_sync" string="Catalogue synced"/>
                         </group>
                     </group>
                     <group string="Who can use this server">
@@ -60,6 +65,31 @@
                     <div class="alert alert-info" role="status" invisible="not status">
                         <field name="status" readonly="1" nolabel="1"/>
                     </div>
+                    <notebook>
+                        <page string="Skills" name="skills">
+                            <field name="skill_ids" readonly="1">
+                                <list decoration-muted="not available">
+                                    <field name="name"/>
+                                    <field name="kind"/>
+                                    <field name="activation"/>
+                                    <field name="enabled"/>
+                                    <field name="available" string="On server"/>
+                                    <field name="description" optional="hide"/>
+                                </list>
+                            </field>
+                        </page>
+                        <page string="Personas" name="personas">
+                            <field name="persona_ids" readonly="1">
+                                <list decoration-muted="not available">
+                                    <field name="display_label" string="Name"/>
+                                    <field name="name" string="Slug"/>
+                                    <field name="applies_to_kinds"/>
+                                    <field name="is_default"/>
+                                    <field name="available" string="On server"/>
+                                </list>
+                            </field>
+                        </page>
+                    </notebook>
                 </sheet>
             </form>
         </field>

@@ -187,6 +187,11 @@ class TurnstoneController(http.Controller):
                         "name": p.get("name"),
                         "display_name": p.get("display_name") or p.get("name"),
                         "description": (p.get("description") or "")[:200],
+                        "applies_to_kinds": (
+                            ", ".join(p["applies_to_kinds"])
+                            if isinstance(p.get("applies_to_kinds"), list)
+                            else (p.get("applies_to_kinds") or "")
+                        ),
                     }
                     for p in personas
                     if p.get("enabled", True)

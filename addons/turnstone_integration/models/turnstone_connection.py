@@ -37,13 +37,27 @@ class TurnstoneConnection(models.Model):
         help="Used for new chat sessions when the user does not pick a server.",
     )
 
-    default_skill = fields.Char(
-        help="Skill applied to new sessions when none is chosen. Leave empty for the "
-             "server's own default.",
+    skill_ids = fields.One2many("turnstone.skill", "connection_id")
+    persona_ids = fields.One2many("turnstone.persona", "connection_id")
+    skill_count = fields.Integer(compute="_compute_catalog_counts")
+    persona_count = fields.Integer(compute="_compute_catalog_counts")
+    catalog_sync = fields.Datetime(string="Catalogue Synced", readonly=True)
+
+    default_skill_id = fields.Many2one(
+        "turnstone.skill", string="Default Skill",
+        domain="[('connection_id', '=', id), ('available', '=', True)]",
+        ondelete="set null",
+        help="Applied to new sessions when none is chosen.",
     )
-    default_persona = fields.Char(
-        help="Persona slug applied to new sessions when none is chosen.",
+    default_persona_id = fields.Many2one(
+        "turnstone.persona", string="Default Persona",
+        domain="[('connection_id', '=', id), ('available', '=', True)]",
+        ondelete="set null",
     )
+    # The names actually sent to Turnstone. Kept as stored fields so a sync that
+    # loses a row cannot silently blank what sessions were being created with.
+    default_skill = fields.Char(compute="_compute_default_names", store=True)
+    default_persona = fields.Char(compute="_compute_default_names", store=True)
     default_model = fields.Char(
         help="Model alias for new sessions. Leave empty to use the node default.",
     )
@@ -64,6 +78,97 @@ class TurnstoneConnection(models.Model):
         "unique(base_url, company_id)",
         "A connection to that Turnstone URL already exists for this company.",
     )
+
+    @api.depends("default_skill_id.name", "default_persona_id.name")
+    def _compute_default_names(self):
+        for rec in self:
+            rec.default_skill = rec.default_skill_id.name or False
+            rec.default_persona = rec.default_persona_id.name or False
+
+    def _compute_catalog_counts(self):
+        for rec in self:
+            rec.skill_count = len(rec.skill_ids.filtered("available"))
+            rec.persona_count = len(rec.persona_ids.filtered("available"))
+
+    def action_sync_catalog(self):
+        """Pull skills and personas from Turnstone into local records.
+
+        Upsert, never replace. A skill that has gone from the server is flagged
+        unavailable rather than deleted, so an agent still points at a named
+        thing instead of silently losing its configuration.
+        """
+        self.ensure_one()
+        client = self._client()
+        Skill = self.env["turnstone.skill"].sudo()
+        Persona = self.env["turnstone.persona"].sudo()
+        now = fields.Datetime.now()
+
+        seen_skills = []
+        for row in client.skills():
+            name = row.get("name")
+            if not name:
+                continue
+            seen_skills.append(name)
+            vals = {
+                "description": (row.get("description") or "")[:2000],
+                "kind": row.get("kind") if row.get("kind") in
+                        ("interactive", "coordinator", "any") else False,
+                "activation": row.get("activation") or False,
+                "template_id": row.get("template_id") or False,
+                "enabled": bool(row.get("enabled", True)),
+                "available": True,
+                "last_sync": now,
+            }
+            existing = Skill.search(
+                [("connection_id", "=", self.id), ("name", "=", name)], limit=1
+            )
+            if existing:
+                existing.write(vals)
+            else:
+                Skill.create(dict(vals, connection_id=self.id, name=name))
+        Skill.search([
+            ("connection_id", "=", self.id), ("name", "not in", seen_skills),
+        ]).write({"available": False})
+
+        seen_personas = []
+        for row in client.personas():
+            name = row.get("name")
+            if not name:
+                continue
+            seen_personas.append(name)
+            kinds = row.get("applies_to_kinds")
+            vals = {
+                "display_label": row.get("display_name") or name,
+                "description": (row.get("description") or "")[:2000],
+                "applies_to_kinds": ", ".join(kinds) if isinstance(kinds, list) else (kinds or False),
+                "is_default": bool(row.get("is_default")),
+                "enabled": bool(row.get("enabled", True)),
+                "available": True,
+                "last_sync": now,
+            }
+            existing = Persona.search(
+                [("connection_id", "=", self.id), ("name", "=", name)], limit=1
+            )
+            if existing:
+                existing.write(vals)
+            else:
+                Persona.create(dict(vals, connection_id=self.id, name=name))
+        Persona.search([
+            ("connection_id", "=", self.id), ("name", "not in", seen_personas),
+        ]).write({"available": False})
+
+        self.sudo().catalog_sync = now
+        return {
+            "type": "ir.actions.client",
+            "tag": "display_notification",
+            "params": {
+                "type": "success",
+                "title": _("Catalogue synced"),
+                "message": _("%(s)s skills and %(p)s personas from %(name)s.")
+                % {"s": len(seen_skills), "p": len(seen_personas), "name": self.name},
+                "sticky": False,
+            },
+        }
 
     def _compute_session_count(self):
         data = self.env["turnstone.session"]._read_group(
@@ -144,6 +249,12 @@ class TurnstoneConnection(models.Model):
             },
             "status_ok": True,
         })
+        # The first thing anyone wants after a successful test is the catalogue,
+        # and doing it here means skills are selectable immediately.
+        try:
+            self.action_sync_catalog()
+        except UserError:
+            pass
         return {
             "type": "ir.actions.client",
             "tag": "display_notification",

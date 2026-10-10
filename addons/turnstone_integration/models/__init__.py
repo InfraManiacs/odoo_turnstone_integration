@@ -1,5 +1,6 @@
 from . import turnstone_client
 from . import turnstone_connection
+from . import turnstone_catalog
 from . import turnstone_agent
 from . import turnstone_audit_log
 from . import turnstone_session
