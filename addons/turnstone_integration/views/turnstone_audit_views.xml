@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <record id="view_turnstone_audit_list" model="ir.ui.view">
+        <field name="name">turnstone.audit.log.list</field>
+        <field name="model">turnstone.audit.log</field>
+        <field name="arch" type="xml">
+            <list string="Audit Log" create="false" edit="false" delete="false"
+                  decoration-danger="action in ('tool_deny', 'access_denied')"
+                  decoration-warning="action == 'tool_approve'">
+                <field name="create_date" string="When"/>
+                <field name="user_id" widget="many2one_avatar_user"/>
+                <field name="action"/>
+                <field name="agent_name" string="Agent"/>
+                <field name="session_name" string="Session"/>
+                <field name="tool_name" string="Tool"/>
+                <field name="ws_id" string="Workstream" optional="hide"/>
+                <field name="detail" optional="hide"/>
+            </list>
+        </field>
+    </record>
+
+    <record id="view_turnstone_audit_search" model="ir.ui.view">
+        <field name="name">turnstone.audit.log.search</field>
+        <field name="model">turnstone.audit.log</field>
+        <field name="arch" type="xml">
+            <search>
+                <field name="user_id"/>
+                <field name="tool_name"/>
+                <field name="session_name"/>
+                <field name="ws_id"/>
+                <filter name="approvals" string="Approvals &amp; Denials"
+                        domain="[('action', 'in', ['tool_approve', 'tool_deny'])]"/>
+                <filter name="denied" string="Access Refused"
+                        domain="[('action', '=', 'access_denied')]"/>
+                <filter name="writes" string="Changes to Sessions"
+                        domain="[('action', 'in', ['session_create','session_adopt','session_close','session_rewind','session_retry','generation_cancel'])]"/>
+                <separator/>
+                <filter name="today" string="Today"
+                        domain="[('create_date', '&gt;=', datetime.datetime.combine(context_today(), datetime.time(0,0,0)))]"/>
+                <group name="group_by">
+                    <filter name="by_user" string="User" context="{'group_by': 'user_id'}"/>
+                    <filter name="by_action" string="Action" context="{'group_by': 'action'}"/>
+                    <filter name="by_agent" string="Agent" context="{'group_by': 'agent_id'}"/>
+                    <filter name="by_day" string="Day" context="{'group_by': 'create_date:day'}"/>
+                </group>
+            </search>
+        </field>
+    </record>
+
+    <record id="action_turnstone_audit" model="ir.actions.act_window">
+        <field name="name">Audit Log</field>
+        <field name="res_model">turnstone.audit.log</field>
+        <field name="view_mode">list</field>
+        <field name="help" type="html">
+            <p class="o_view_nocontent_smiling_face">Nothing logged yet</p>
+            <p>
+                Turnstone keeps its own audit of tool calls, but it only ever sees one
+                identity — the server API token. Which of your people approved a given
+                restart is a question only this log can answer.
+            </p>
+        </field>
+    </record>
+
+</odoo>

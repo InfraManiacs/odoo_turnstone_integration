@@ -15,6 +15,7 @@ import logging
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 from odoo import _
 from odoo.exceptions import UserError
@@ -147,7 +148,8 @@ class TurnstoneClient:
     # -- sessions ----------------------------------------------------------
 
     def create_session(self, name=None, skill=None, persona=None, model=None,
-                       initial_message=None, kind="interactive"):
+                       initial_message=None, kind="interactive", judge_model=None,
+                       auto_approve=None, auto_approve_tools=None):
         """Start a workstream, on whichever surface owns that kind.
 
         The console/route split applies to CREATION too, and Turnstone is
@@ -176,12 +178,22 @@ class TurnstoneClient:
             payload["initial_message"] = initial_message
 
         if kind == "coordinator":
+            # The console create endpoint takes name/skill/persona/initial_message
+            # and nothing else — model, judge_model and the auto-approve fields
+            # are simply absent from its schema, so passing them would be a lie
+            # rather than a setting. Callers are told this at the UI layer.
             return self._request("POST", "/workstreams/new", payload, timeout=LONG_TIMEOUT)
 
         payload["kind"] = "interactive"
         payload["client_type"] = "web"
         if model:
             payload["model"] = model
+        if judge_model:
+            payload["judge_model"] = judge_model
+        if auto_approve:
+            payload["auto_approve"] = True
+        if auto_approve_tools:
+            payload["auto_approve_tools"] = list(auto_approve_tools)
         return self._request("POST", "/route/workstreams/new", payload, timeout=LONG_TIMEOUT)
 
     # THE CONSOLE API AND THE NODE API ARE NOT THE SAME SURFACE.
@@ -198,6 +210,60 @@ class TurnstoneClient:
     @staticmethod
     def _ws_prefix(kind):
         return "/workstreams" if kind == "coordinator" else "/route/workstreams"
+
+    # -- attachments -------------------------------------------------------
+    #
+    # COORDINATOR-ONLY. Uploading to an interactive session answers
+    # {"error": "coordinator not found"}. Verified against 1.8.3, along with
+    # which types Turnstone accepts:
+    #   image/*            -> kind "image"
+    #   application/pdf    -> kind "pdf"
+    #   text/*, application/json -> kind "text"
+    #   xlsx, docx         -> REJECTED, "Unsupported file type"
+    # So Office formats have to be converted before they get here.
+
+    def upload_attachment(self, ws_id, filename, content, mime_type):
+        """Multipart upload, built by hand to avoid a requests dependency."""
+        boundary = "----turnstone%s" % uuid.uuid4().hex
+        body = b"".join([
+            ("--%s\r\n" % boundary).encode(),
+            ('Content-Disposition: form-data; name="file"; filename="%s"\r\n'
+             % filename.replace('"', "")).encode(),
+            ("Content-Type: %s\r\n\r\n" % mime_type).encode(),
+            content,
+            ("\r\n--%s--\r\n" % boundary).encode(),
+        ])
+        url = self.api + "/workstreams/%s/attachments" % ws_id
+        req = urllib.request.Request(url, data=body, method="POST", headers={
+            "Authorization": "Bearer %s" % self.token,
+            "Content-Type": "multipart/form-data; boundary=%s" % boundary,
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=LONG_TIMEOUT) as resp:
+                return json.loads(resp.read().decode() or "{}")
+        except urllib.error.HTTPError as exc:
+            payload = exc.read().decode()[:400]
+            try:
+                message = json.loads(payload).get("error") or payload
+            except json.JSONDecodeError:
+                message = payload
+            raise TurnstoneError(
+                _("Turnstone refused %(name)s: %(err)s") % {"name": filename, "err": message}
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise TurnstoneError(
+                _("Cannot reach Turnstone at %(url)s: %(reason)s")
+                % {"url": self.base_url, "reason": exc.reason}
+            ) from exc
+
+    def list_attachments(self, ws_id):
+        data = self._request("GET", "/workstreams/%s/attachments" % ws_id)
+        return data.get("attachments", []) if isinstance(data, dict) else (data or [])
+
+    def delete_attachment(self, ws_id, attachment_id):
+        return self._request(
+            "DELETE", "/workstreams/%s/attachments/%s" % (ws_id, attachment_id)
+        )
 
     def session_detail(self, ws_id):
         """Persisted row + live block + message tail, for any session on any node.

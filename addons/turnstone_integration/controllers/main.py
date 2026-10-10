@@ -57,10 +57,26 @@ class TurnstoneController(http.Controller):
             conns = Connection.search([])
             usable = conns.filtered(
                 lambda c: not c.sudo().allowed_group_ids
-                or (request.env.user.groups_id & c.sudo().allowed_group_ids)
+                or (request.env.user.group_ids & c.sudo().allowed_group_ids)
             )
             icp = request.env["ir.config_parameter"].sudo()
             return {
+                "agents": [
+                    {
+                        "id": a.id,
+                        "name": a.name,
+                        "description": a.description or "",
+                        "kind": a.kind,
+                        "skill": a.sudo().skill or None,
+                        "persona": a.sudo().persona or None,
+                        "model": a.sudo().model_alias or None,
+                        "connection_id": a.connection_id.id,
+                        "connection_name": a.connection_id.name,
+                        "supports_attachments": a.kind == "coordinator",
+                        "color": a.color,
+                    }
+                    for a in request.env["turnstone.agent"]._available_for_user()
+                ],
                 "connections": [
                     {
                         "id": c.id,
@@ -140,7 +156,23 @@ class TurnstoneController(http.Controller):
             client = conn._client()
             skills = client.skills()
             personas = client.personas()
+            # /v1/api/models is empty when aliases come from the node's TOML
+            # rather than the DB, which is this deployment's shape. Harvest the
+            # aliases actually in use so the picker suggests something real, and
+            # still allow free text.
+            aliases = set()
+            try:
+                for row in (client.cluster_workstreams(per_page=200).get("workstreams") or []):
+                    alias = row.get("model_alias") or row.get("model")
+                    if alias:
+                        aliases.add(alias)
+            except UserError:
+                pass
+            for extra in (conn.sudo().default_model,):
+                if extra:
+                    aliases.add(extra)
             return {
+                "models": sorted(aliases),
                 "skills": [
                     {
                         "name": s.get("name"),
@@ -189,6 +221,7 @@ class TurnstoneController(http.Controller):
                 "model_alias": model or False,
                 "kind": kind,
             })
+            request.env["turnstone.audit.log"].log("session_create", session=session)
             # The workstream itself is created lazily on the first message, so
             # opening the composer and changing your mind costs nothing on the
             # Turnstone side.
@@ -196,6 +229,79 @@ class TurnstoneController(http.Controller):
                 "session": session._as_dict(),
                 "sessions": self._session_list(include_id=session.id),
             }
+        except (UserError, AccessError) as exc:
+            return self._error(exc)
+
+    @http.route("/turnstone/session/new_from_agent", type="jsonrpc", auth="user")
+    def session_new_from_agent(self, agent_id, name=None):
+        """Start a session from a saved agent configuration.
+
+        This is the path users should normally take: the agent already carries a
+        valid kind/skill/persona/model combination, so the quiet failure mode
+        (an interactive session asked to fan out) cannot happen by accident.
+        """
+        try:
+            self._require_user()
+            agent = request.env["turnstone.agent"].browse(int(agent_id)).exists()
+            if not agent:
+                raise UserError(_("No such agent."))
+            try:
+                agent._check_user_allowed()
+            except UserError:
+                request.env["turnstone.audit.log"].log(
+                    "access_denied", agent=agent,
+                    detail=_("Tried to start an agent they are not permitted to use."),
+                )
+                raise
+            session = request.env["turnstone.session"].create({
+                "name": name or agent.name,
+                "connection_id": agent.connection_id.id,
+                "agent_id": agent.id,
+                "kind": agent.kind,
+                "skill": agent.sudo().skill or False,
+                "persona": agent.sudo().persona or False,
+                "model_alias": agent.sudo().model_alias or False,
+            })
+            request.env["turnstone.audit.log"].log(
+                "session_create", session=session, agent=agent,
+            )
+            return {
+                "session": session._as_dict(),
+                "sessions": self._session_list(include_id=session.id),
+            }
+        except (UserError, AccessError) as exc:
+            return self._error(exc)
+
+    # -- attachments -------------------------------------------------------
+
+    @http.route("/turnstone/session/attachments", type="jsonrpc", auth="user")
+    def session_attachments(self, session_id):
+        try:
+            session = self._session(session_id)
+            return {
+                "supports_attachments": session.supports_attachments,
+                "attachments": session.attachments(),
+            }
+        except (UserError, AccessError) as exc:
+            return self._error(exc)
+
+    @http.route("/turnstone/session/attachment/add", type="jsonrpc", auth="user")
+    def session_attachment_add(self, session_id, filename, content, mime_type=None):
+        try:
+            session = self._session(session_id)
+            session.check_access("write")
+            result = session.action_add_attachment(filename, content, mime_type)
+            return {"attachment": result, "attachments": session.attachments()}
+        except (UserError, AccessError) as exc:
+            return self._error(exc)
+
+    @http.route("/turnstone/session/attachment/remove", type="jsonrpc", auth="user")
+    def session_attachment_remove(self, session_id, attachment_id):
+        try:
+            session = self._session(session_id)
+            session.check_access("write")
+            session.action_remove_attachment(attachment_id)
+            return {"attachments": session.attachments()}
         except (UserError, AccessError) as exc:
             return self._error(exc)
 

@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <record id="view_turnstone_agent_list" model="ir.ui.view">
+        <field name="name">turnstone.agent.list</field>
+        <field name="model">turnstone.agent</field>
+        <field name="arch" type="xml">
+            <list string="Agents">
+                <field name="sequence" widget="handle"/>
+                <field name="name"/>
+                <field name="kind"/>
+                <field name="skill"/>
+                <field name="persona"/>
+                <field name="model_alias"/>
+                <field name="auto_approve"/>
+                <field name="group_ids" widget="many2many_tags" string="Restricted to"/>
+                <field name="session_count" string="Sessions"/>
+                <field name="connection_id"/>
+            </list>
+        </field>
+    </record>
+
+    <record id="view_turnstone_agent_form" model="ir.ui.view">
+        <field name="name">turnstone.agent.form</field>
+        <field name="model">turnstone.agent</field>
+        <field name="arch" type="xml">
+            <form string="Agent">
+                <header>
+                    <button name="action_start_session" type="object" string="Start Session"
+                            class="btn-primary"/>
+                </header>
+                <sheet>
+                    <div class="oe_button_box" name="button_box">
+                        <button name="action_view_sessions" type="object" class="oe_stat_button"
+                                icon="fa-comments">
+                            <field name="session_count" widget="statinfo" string="Sessions"/>
+                        </button>
+                    </div>
+                    <field name="active" invisible="1"/>
+                    <div class="oe_title">
+                        <label for="name"/>
+                        <h1><field name="name" placeholder="Kube SRE"/></h1>
+                    </div>
+                    <group>
+                        <group string="Agent">
+                            <field name="connection_id"/>
+                            <field name="kind"/>
+                            <field name="skill" placeholder="kube-sre"/>
+                            <field name="persona" placeholder="avware-sre"/>
+                            <field name="model_alias" placeholder="agentic-coder"
+                                   invisible="kind == 'coordinator'"/>
+                            <div colspan="2" class="text-muted small"
+                                 invisible="kind != 'coordinator'">
+                                A coordinator runs on the node's default model — Turnstone's
+                                console create endpoint takes no model, so the setting would
+                                be silently ignored. Its children can still be routed by the
+                                coordinator itself.
+                            </div>
+                            <field name="judge_model" placeholder="judge"
+                                   invisible="kind == 'coordinator'"/>
+                        </group>
+                        <group string="Approvals">
+                            <field name="auto_approve" invisible="kind == 'coordinator'"/>
+                            <field name="auto_approve_tools" invisible="kind == 'coordinator'"
+                                   placeholder="mcp__kube__pods_list, mcp__kube__events_list"/>
+                            <div colspan="2" class="alert alert-warning mb-0"
+                                 role="alert" invisible="not auto_approve">
+                                Every tool runs without asking. Tool policy is still evaluated
+                                first, so a denied tool stays denied — but anything on "ask"
+                                will no longer stop for a human.
+                            </div>
+                            <div colspan="2" class="text-muted small"
+                                 invisible="kind != 'coordinator'">
+                                Approval settings are not accepted by the console create
+                                endpoint, so a coordinator uses the server defaults.
+                            </div>
+                        </group>
+                    </group>
+                    <group string="Who can use this agent">
+                        <field name="group_ids" widget="many2many_tags" nolabel="1" colspan="2"
+                               placeholder="Leave empty to allow any Turnstone User"/>
+                    </group>
+                    <group string="Description">
+                        <field name="description" nolabel="1" colspan="2"
+                               placeholder="What this agent is for, and what it will touch."/>
+                    </group>
+                </sheet>
+            </form>
+        </field>
+    </record>
+
+    <record id="action_turnstone_agent" model="ir.actions.act_window">
+        <field name="name">Agents</field>
+        <field name="res_model">turnstone.agent</field>
+        <field name="view_mode">list,form</field>
+        <field name="help" type="html">
+            <p class="o_view_nocontent_smiling_face">Define an agent once</p>
+            <p>
+                An agent bundles a server, a kind, a skill, a persona, a model and an
+                approval policy under a name your users will recognise — so starting a
+                session is one click, and every session of the same kind is comparable.
+            </p>
+        </field>
+    </record>
+
+</odoo>

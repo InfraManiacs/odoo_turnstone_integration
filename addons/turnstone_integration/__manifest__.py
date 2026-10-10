@@ -35,6 +35,8 @@ controllers, which call Turnstone server-side.
         "security/turnstone_security.xml",
         "security/ir.model.access.csv",
         "views/turnstone_connection_views.xml",
+        "views/turnstone_agent_views.xml",
+        "views/turnstone_audit_views.xml",
         "views/turnstone_session_views.xml",
         "views/turnstone_schedule_views.xml",
         "views/turnstone_live_views.xml",

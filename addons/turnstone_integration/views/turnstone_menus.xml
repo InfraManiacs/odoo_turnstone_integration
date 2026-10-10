@@ -19,6 +19,13 @@
               sequence="10"
               groups="turnstone_integration.group_turnstone_user"/>
 
+    <menuitem id="menu_turnstone_agents"
+              name="Agents"
+              parent="menu_turnstone_root"
+              action="action_turnstone_agent"
+              sequence="15"
+              groups="turnstone_integration.group_turnstone_manager"/>
+
     <menuitem id="menu_turnstone_sessions"
               name="Sessions"
               parent="menu_turnstone_root"
@@ -38,6 +45,13 @@
               parent="menu_turnstone_root"
               sequence="90"
               groups="turnstone_integration.group_turnstone_manager"/>
+
+    <menuitem id="menu_turnstone_audit"
+              name="Audit Log"
+              parent="menu_turnstone_root"
+              action="action_turnstone_audit"
+              sequence="40"
+              groups="turnstone_integration.group_turnstone_user"/>
 
     <menuitem id="menu_turnstone_connections"
               name="Servers"

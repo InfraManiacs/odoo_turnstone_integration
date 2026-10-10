@@ -211,3 +211,23 @@
     opacity: .75;
     &:hover { opacity: 1; text-decoration: underline; }
 }
+
+.o_turnstone_chat {
+    .o_ts_agent_card {
+        cursor: pointer;
+        border: 1px solid rgba(0, 0, 0, .1);
+        border-radius: .35rem;
+        &:hover {
+            border-color: var(--bs-primary, #714b67);
+            background-color: rgba(0, 0, 0, .02);
+        }
+    }
+
+    .o_ts_attachments { flex: 0 0 auto; }
+
+    .o_ts_chip_x {
+        cursor: pointer;
+        opacity: .5;
+        &:hover { opacity: 1; }
+    }
+}

@@ -29,8 +29,60 @@ asking Turnstone over its HTTP API.
   anything else.
 - **Scheduled jobs** — Turnstone's cron tasks and run history, and a run can be
   opened to see exactly what that firing did.
+- **Agents** — saved configurations (server, kind, skill, persona, model, judge
+  model, approval policy) that users start by name, so nobody assembles one by
+  hand and every session of a kind is comparable.
+- **Per-agent access control** — which Odoo groups may start which agent. This
+  is the module's RBAC gate.
+- **Audit log** — append-only record of what each Odoo user did here.
+- **File attachments** — images, PDF and text/CSV/JSON, on coordinator sessions.
 - **Multiple servers** — connect to more than one Turnstone, with per-connection
   group restrictions.
+
+## Agents and access
+
+An administrator defines an agent once under **Turnstone → Agents**; users pick
+it from the chat. The alternative — assembling server/kind/skill/persona/model
+per session — guarantees nobody does it consistently, and gets the kind/skill
+pairing wrong in a way that fails silently.
+
+`group_ids` on the agent decides who may start it. Empty means any Turnstone
+User. It only ever narrows: Turnstone User is still required, and the
+connection's own restriction applies as well. Agents a user may not start are
+not listed, and calling the endpoint directly is refused and logged as
+`access_denied`.
+
+## Audit
+
+Turnstone keeps its own audit of tool calls and verdicts, but it only ever sees
+one identity — the server API token. "Which of our people approved that restart"
+is a question only this log can answer, which is why it exists.
+
+Append-only by construction: `write` and `unlink` both raise, no view offers
+either, and managers get no write bit in the ACLs. Users see their own trail;
+managers see everyone's.
+
+Logged: session create and adopt, messages, tool approvals and denials, stop,
+retry, rewind, close, attachments added and removed, and refused access.
+
+## Files
+
+Verified against Turnstone 1.8.3, by uploading each type:
+
+| type | result |
+|---|---|
+| `image/*` | accepted, `kind: image` |
+| `application/pdf` | accepted, `kind: pdf` |
+| `text/plain`, `text/csv`, `application/json` | accepted, `kind: text` |
+| `.xlsx`, `.docx` | **rejected** — "Unsupported file type" |
+
+Two constraints worth knowing before designing around this:
+
+- **Attachments are coordinator-only.** Uploading to an interactive session
+  answers `{"error": "coordinator not found"}`. The chat only shows the attach
+  control when the session can actually take one.
+- **Office formats are not supported.** Spreadsheets and Word documents have to
+  be converted before they reach Turnstone — see "A file-handling MCP" below.
 
 ## Quick start
 
@@ -166,6 +218,31 @@ getting it wrong produces a link that looks right and points at the wrong record
 
 Read-only tools (`odoo_search_read`, `odoo_read`) never produce a link.
 
+## A file-handling MCP (not built)
+
+Turnstone natively handles the formats a model can read directly — images, PDF,
+plain text. It does not handle the formats a business actually mails around:
+xlsx, docx, and anything else needing extraction before a model can reason over
+it.
+
+The gap is narrower than "file handling" in general, which matters for scoping.
+What is missing is a conversion and inspection surface:
+
+- sniff a real type rather than trusting the extension
+- xlsx/csv to structured rows, with sheet and range selection
+- docx/pptx to text
+- PDF text extraction where the PDF is not already text (scanned pages)
+- bounded size and page limits, because an agent will happily ask for all of it
+
+The honest shape is a small MCP server beside `kube-mcp`, registered with
+Turnstone the same way, reachable only from Turnstone pods, with each conversion
+a separately-named tool so tool policy can gate them — the same reasoning as
+`docs/SRE.md` in the kube fork. It is deliberately NOT built here: it is a
+deployment in the GitOps repo, not an Odoo module.
+
+Until it exists, converting an xlsx to CSV before attaching it works today and
+needs nothing new.
+
 ## Odoo 19 notes
 
 Written against 19.0 and tested on `odoo:19.0-20260926`. Things that changed from
@@ -179,6 +256,11 @@ Written against 19.0 and tested on `odoo:19.0-20260926`. Things that changed fro
 - Search views reject `<group string=...>` and `expand=...`; use
   `<group name="group_by">`.
 - `t-esc` is deprecated in favour of `t-out`.
+- `res.users.groups_id` is now `group_ids`. This one bites late: expressions like
+  `allowed and (user.groups_id & allowed)` short-circuit while no record has
+  restrictions set, so the rename stays invisible until the first group is
+  assigned.
+- XML attributes need values — `<input multiple>` must be `multiple="multiple"`.
 
 ## Development
 

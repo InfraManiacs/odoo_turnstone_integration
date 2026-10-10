@@ -103,7 +103,7 @@ class TurnstoneConnection(models.Model):
         if not user.has_group("turnstone_integration.group_turnstone_user"):
             raise UserError(_("You do not have access to Turnstone."))
         allowed = self.sudo().allowed_group_ids
-        if allowed and not (user.groups_id & allowed):
+        if allowed and not (user.group_ids & allowed):
             raise UserError(
                 _("You are not permitted to use the Turnstone server %s.") % self.display_name
             )
@@ -115,7 +115,7 @@ class TurnstoneConnection(models.Model):
         user = user or self.env.user
         candidates = self.search([("company_id", "in", self.env.companies.ids)])
         usable = candidates.filtered(
-            lambda c: not c.sudo().allowed_group_ids or (user.groups_id & c.sudo().allowed_group_ids)
+            lambda c: not c.sudo().allowed_group_ids or (user.group_ids & c.sudo().allowed_group_ids)
         )
         if not usable:
             raise UserError(

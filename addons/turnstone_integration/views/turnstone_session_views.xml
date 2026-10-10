@@ -9,6 +9,7 @@
                   decoration-muted="state == 'closed'" decoration-danger="state == 'error'">
                 <field name="name"/>
                 <field name="user_id" widget="many2one_avatar_user"/>
+                <field name="agent_id"/>
                 <field name="connection_id"/>
                 <field name="skill"/>
                 <field name="state" widget="badge"/>
@@ -43,6 +44,7 @@
                     <group>
                         <group string="Session">
                             <field name="user_id"/>
+                            <field name="agent_id"/>
                             <field name="connection_id"/>
                             <field name="ws_id"/>
                             <field name="node_id"/>
@@ -126,6 +128,7 @@
                         domain="[('linked_record_ids', '!=', False)]"/>
                 <group name="group_by">
                     <filter name="by_user" string="Owner" context="{'group_by': 'user_id'}"/>
+                    <filter name="by_agent" string="Agent" context="{'group_by': 'agent_id'}"/>
                     <filter name="by_skill" string="Skill" context="{'group_by': 'skill'}"/>
                     <filter name="by_state" string="Status" context="{'group_by': 'state'}"/>
                 </group>

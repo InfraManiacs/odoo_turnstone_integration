@@ -107,6 +107,37 @@
             <field name="groups" eval="[(4, ref('group_turnstone_manager'))]"/>
         </record>
 
+        <!--
+            Everyone may READ agent definitions (the picker needs them), but
+            _available_for_user filters what is offered and _check_user_allowed
+            is what actually gates starting one. Reading a definition is not the
+            privilege; running it is.
+        -->
+        <record id="rule_agent_company" model="ir.rule">
+            <field name="name">Turnstone: agents per company</field>
+            <field name="model_id" ref="model_turnstone_agent"/>
+            <field name="domain_force">[('company_id', 'in', company_ids + [False])]</field>
+        </record>
+
+        <!--
+            A user sees their own audit trail; managers see everyone's. Nobody
+            can write or delete: the model refuses both, and the ACLs grant no
+            write bit even to managers.
+        -->
+        <record id="rule_audit_own" model="ir.rule">
+            <field name="name">Turnstone: own audit entries</field>
+            <field name="model_id" ref="model_turnstone_audit_log"/>
+            <field name="domain_force">[('user_id', '=', user.id)]</field>
+            <field name="groups" eval="[(4, ref('group_turnstone_user'))]"/>
+        </record>
+
+        <record id="rule_audit_manager" model="ir.rule">
+            <field name="name">Turnstone: managers see the whole audit trail</field>
+            <field name="model_id" ref="model_turnstone_audit_log"/>
+            <field name="domain_force">[(1, '=', 1)]</field>
+            <field name="groups" eval="[(4, ref('group_turnstone_manager'))]"/>
+        </record>
+
         <record id="rule_connection_company" model="ir.rule">
             <field name="name">Turnstone: connections per company</field>
             <field name="model_id" ref="model_turnstone_connection"/>

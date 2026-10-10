@@ -7,8 +7,10 @@ refreshed from Turnstone rather than maintained here — if the two disagree,
 Turnstone is right.
 """
 
+import base64
 import json
 import logging
+import mimetypes
 import re
 
 from odoo import _, api, fields, models
@@ -36,6 +38,14 @@ class TurnstoneSession(models.Model):
     ws_id = fields.Char(
         string="Workstream ID", readonly=True, index=True, copy=False,
         help="Turnstone's id for this session. Empty until the first message is sent.",
+    )
+    agent_id = fields.Many2one(
+        "turnstone.agent", ondelete="set null", index=True,
+        help="The saved configuration this session was started from.",
+    )
+    supports_attachments = fields.Boolean(
+        compute="_compute_supports_attachments",
+        help="Turnstone accepts attachments on coordinator workstreams only.",
     )
     connection_id = fields.Many2one(
         "turnstone.connection", required=True, ondelete="restrict",
@@ -115,6 +125,11 @@ class TurnstoneSession(models.Model):
             rec.has_pending_approval = bool(rec.pending_approval_json and
                                             rec.pending_approval_json != "[]")
 
+    @api.depends("kind")
+    def _compute_supports_attachments(self):
+        for rec in self:
+            rec.supports_attachments = rec.kind == "coordinator"
+
     def _compute_subagent_count(self):
         data = self.env["turnstone.subagent"]._read_group(
             [("session_id", "in", self.ids)], ["session_id"], ["__count"]
@@ -156,13 +171,17 @@ class TurnstoneSession(models.Model):
             return self.ws_id
         conn = self.connection_id
         conn._check_user_allowed(self.user_id)
+        agent = self.agent_id.sudo()
         result = conn._client().create_session(
             name=self.name,
-            skill=self.skill or conn.sudo().default_skill or None,
-            persona=self.persona or conn.sudo().default_persona or None,
-            model=self.model_alias or conn.sudo().default_model or None,
+            skill=self.skill or agent.skill or conn.sudo().default_skill or None,
+            persona=self.persona or agent.persona or conn.sudo().default_persona or None,
+            model=self.model_alias or agent.model_alias or conn.sudo().default_model or None,
             initial_message=first_message,
             kind=self.kind or "interactive",
+            judge_model=agent.judge_model or None,
+            auto_approve=agent.auto_approve or None,
+            auto_approve_tools=agent.auto_approve_tool_list() if agent else None,
         )
         self.sudo().write({
             "ws_id": result.get("ws_id"),
@@ -192,6 +211,9 @@ class TurnstoneSession(models.Model):
             self.connection_id._client().send(self.ws_id, body, kind=self.kind)
 
         self.sudo().write({"state": "thinking", "last_activity": fields.Datetime.now()})
+        self.env["turnstone.audit.log"].log(
+            "message_send", session=self, detail=body[:500],
+        )
         return self.sync_from_server()
 
     def action_approve(self, approved, feedback=None):
@@ -200,17 +222,24 @@ class TurnstoneSession(models.Model):
         self._check_owner()
         if not self.ws_id:
             raise UserError(_("This session has not started."))
-        cycle_id = None
+        cycle_id, tool_name = None, None
         try:
             pending = json.loads(self.pending_approval_json or "[]")
             if pending:
                 cycle_id = pending[0].get("cycle_id")
+                items = pending[0].get("items") or []
+                if items:
+                    tool_name = items[0].get("func_name") or items[0].get("approval_label")
         except (ValueError, AttributeError, IndexError):
-            cycle_id = None
+            cycle_id, tool_name = None, None
         self.connection_id._client().approve(
             self.ws_id, approved, feedback=feedback, cycle_id=cycle_id, kind=self.kind
         )
         self.sudo().write({"state": "thinking", "pending_approval_json": "[]"})
+        self.env["turnstone.audit.log"].log(
+            "tool_approve" if approved else "tool_deny",
+            session=self, tool=tool_name, detail=feedback or None,
+        )
         return self.sync_from_server()
 
     def action_retry(self):
@@ -220,6 +249,7 @@ class TurnstoneSession(models.Model):
         if not self.ws_id:
             raise UserError(_("This session has not started."))
         self.connection_id._client().retry(self.ws_id, kind=self.kind)
+        self.env["turnstone.audit.log"].log("session_retry", session=self)
         self.sudo().write({"state": "thinking"})
         return self.sync_from_server()
 
@@ -230,6 +260,9 @@ class TurnstoneSession(models.Model):
         if not self.ws_id:
             raise UserError(_("This session has not started."))
         self.connection_id._client().rewind(self.ws_id, turns=turns, kind=self.kind)
+        self.env["turnstone.audit.log"].log(
+            "session_rewind", session=self, detail=_("%s turn(s)") % turns,
+        )
         return self.sync_from_server()
 
     def action_cancel_queued(self):
@@ -245,6 +278,7 @@ class TurnstoneSession(models.Model):
         self._check_owner()
         if self.ws_id:
             self.connection_id._client().cancel(self.ws_id, kind=self.kind)
+        self.env["turnstone.audit.log"].log("generation_cancel", session=self)
         return self.sync_from_server()
 
     def action_close(self):
@@ -257,6 +291,7 @@ class TurnstoneSession(models.Model):
                 # Already gone server-side; closing locally is still correct.
                 _logger.info("Turnstone close failed for %s; closing locally", self.ws_id)
         self.sudo().write({"state": "closed"})
+        self.env["turnstone.audit.log"].log("session_close", session=self)
         return True
 
     # -- sync --------------------------------------------------------------
@@ -529,6 +564,54 @@ class TurnstoneSession(models.Model):
                 ids.add(int(text))
         return sorted(ids)
 
+    # -- attachments -------------------------------------------------------
+
+    def action_add_attachment(self, filename, content_b64, mime_type=None):
+        """Attach a file to this session's next turn.
+
+        Turnstone accepts images, PDFs and text; it rejects xlsx and docx
+        outright. Rather than let the user discover that from a raw API error,
+        the refusal is caught and explained with what to do instead.
+        """
+        self.ensure_one()
+        self._check_owner()
+        if not self.supports_attachments:
+            raise UserError(_(
+                "Turnstone accepts attachments on coordinator sessions only. "
+                "Start this work with a coordinator agent if it needs files."
+            ))
+        self._ensure_started()
+        raw = base64.b64decode(content_b64)
+        guessed = mime_type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        result = self.connection_id._client().upload_attachment(
+            self.ws_id, filename, raw, guessed
+        )
+        self.env["turnstone.audit.log"].log(
+            "attachment_add", session=self,
+            detail=_("%(name)s (%(mime)s, %(size)s bytes)") % {
+                "name": filename, "mime": guessed, "size": len(raw),
+            },
+        )
+        return result
+
+    def attachments(self):
+        self.ensure_one()
+        self._check_owner()
+        if not self.ws_id or not self.supports_attachments:
+            return []
+        return self.connection_id._client().list_attachments(self.ws_id)
+
+    def action_remove_attachment(self, attachment_id):
+        self.ensure_one()
+        self._check_owner()
+        if not self.ws_id:
+            return True
+        self.connection_id._client().delete_attachment(self.ws_id, attachment_id)
+        self.env["turnstone.audit.log"].log(
+            "attachment_remove", session=self, detail=attachment_id,
+        )
+        return True
+
     # -- subagents ---------------------------------------------------------
 
     def _children(self):
@@ -620,6 +703,10 @@ class TurnstoneSession(models.Model):
             "node_id": persisted.get("node_id") or False,
         })
         session.sync_from_server()
+        self.env["turnstone.audit.log"].log(
+            "session_adopt", session=session,
+            detail=_("Attached to workstream %s started outside Odoo.") % ws_id,
+        )
         return session
 
     @api.model
@@ -700,6 +787,9 @@ class TurnstoneSession(models.Model):
             "parent_session_id": parent.id if parent else None,
             "parent_name": parent.name if parent else None,
             "adopted": rec.adopted,
+            "agent_id": rec.agent_id.id or None,
+            "agent_name": rec.agent_id.name or None,
+            "supports_attachments": rec.supports_attachments,
             "activity": rec.activity or "",
             "activity_state": rec.activity_state or "",
             "tool_calls": rec.tool_call_count,

@@ -35,12 +35,16 @@ export class TurnstoneChat extends Component {
             draft: "",
             sending: false,
             showNewForm: false,
-            catalog: { skills: [], personas: [] },
-            newSession: { connection_id: null, name: "", skill: "", persona: "", kind: "interactive" },
+            catalog: { skills: [], personas: [], models: [] },
+            newSession: { connection_id: null, name: "", skill: "", persona: "", kind: "interactive", model: "" },
             showTools: true,
             children: [],
             showChildren: false,
             expandedTools: {},
+            agents: [],
+            mode: "agent",          // "agent" picker, or "custom" full form
+            attachments: [],
+            uploading: false,
             adoptWsId: "",
             isManager: false,
         });
@@ -124,6 +128,10 @@ export class TurnstoneChat extends Component {
             return;
         }
         this.state.connections = res.connections || [];
+        this.state.agents = res.agents || [];
+        // With no saved agents there is nothing to pick, so go straight to the
+        // full form rather than showing an empty chooser.
+        this.state.mode = this.state.agents.length ? "agent" : "custom";
         this.state.sessions = res.sessions || [];
         this.state.showTools = res.show_tool_calls !== false;
         this.state.isManager = !!res.is_manager;
@@ -146,6 +154,7 @@ export class TurnstoneChat extends Component {
         }
         this.state.session = res.session;
         this.loadChildren();
+        await this.loadAttachments();
         this.maybePoll();
     }
 
@@ -338,7 +347,11 @@ export class TurnstoneChat extends Component {
             if (res.error) {
                 return this.fail(res.error);
             }
-            this.state.catalog = { skills: res.skills || [], personas: res.personas || [] };
+            this.state.catalog = {
+                skills: res.skills || [],
+                personas: res.personas || [],
+                models: res.models || [],
+            };
         }
     }
 
@@ -360,6 +373,81 @@ export class TurnstoneChat extends Component {
         }
     }
 
+    /** Start from a saved agent — the path most users should take. */
+    async startAgent(agent) {
+        const res = await rpc("/turnstone/session/new_from_agent", { agent_id: agent.id });
+        if (res.error) {
+            return this.fail(res.error);
+        }
+        this.navStack = [];
+        this.state.session = res.session;
+        this.state.sessions = res.sessions || this.state.sessions;
+        this.state.showNewForm = false;
+        this.loadChildren();
+        await this.loadAttachments();
+        this.maybePoll();
+    }
+
+    async loadAttachments() {
+        const s = this.state.session;
+        if (!s || !s.supports_attachments || !s.ws_id) {
+            this.state.attachments = [];
+            return;
+        }
+        const res = await rpc("/turnstone/session/attachments", { session_id: s.id });
+        this.state.attachments = res.error ? [] : res.attachments || [];
+    }
+
+    /**
+     * Attach a file.
+     *
+     * Turnstone takes images, PDFs and text/JSON/CSV. It rejects xlsx and docx
+     * outright, so those are caught here with something actionable rather than
+     * a raw "Unsupported file type".
+     */
+    async onFilesPicked(ev) {
+        const files = [...(ev.target.files || [])];
+        ev.target.value = "";
+        if (!files.length || !this.state.session) {
+            return;
+        }
+        this.state.uploading = true;
+        try {
+            for (const file of files) {
+                const b64 = await new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onload = () => resolve(String(reader.result).split(",")[1]);
+                    reader.onerror = reject;
+                    reader.readAsDataURL(file);
+                });
+                const res = await rpc("/turnstone/session/attachment/add", {
+                    session_id: this.state.session.id,
+                    filename: file.name,
+                    content: b64,
+                    mime_type: file.type || undefined,
+                });
+                if (res.error) {
+                    this.fail(res.error);
+                    continue;
+                }
+                this.state.attachments = res.attachments || [];
+            }
+        } finally {
+            this.state.uploading = false;
+        }
+    }
+
+    async removeAttachment(id) {
+        const res = await rpc("/turnstone/session/attachment/remove", {
+            session_id: this.state.session.id,
+            attachment_id: id,
+        });
+        if (res.error) {
+            return this.fail(res.error);
+        }
+        this.state.attachments = res.attachments || [];
+    }
+
     async createSession() {
         const n = this.state.newSession;
         const res = await rpc("/turnstone/session/new", {
@@ -367,6 +455,7 @@ export class TurnstoneChat extends Component {
             name: n.name || undefined,
             skill: n.skill || undefined,
             persona: n.persona || undefined,
+            model: n.model || undefined,
             kind: n.kind,
         });
         if (res.error) {

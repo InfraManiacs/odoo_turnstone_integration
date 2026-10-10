@@ -15,6 +15,45 @@
             </div>
 
             <div t-if="state.showNewForm" class="o_ts_new_form p-2 border-bottom">
+
+                <ul class="nav nav-pills nav-fill mb-2 small" t-if="state.agents.length">
+                    <li class="nav-item">
+                        <a class="nav-link py-1" href="#"
+                           t-att-class="{ active: state.mode === 'agent' }"
+                           t-on-click.prevent="() => state.mode = 'agent'">Agent</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link py-1" href="#"
+                           t-att-class="{ active: state.mode === 'custom' }"
+                           t-on-click.prevent="() => state.mode = 'custom'">Custom</a>
+                    </li>
+                </ul>
+
+                <!-- Saved configurations. One click, and the kind/skill pairing
+                     is already known to be valid. -->
+                <div t-if="state.mode === 'agent'">
+                    <div t-if="!state.agents.length" class="text-muted small">
+                        No agents are configured for you yet.
+                    </div>
+                    <div t-foreach="state.agents" t-as="a" t-key="a.id"
+                         class="o_ts_agent_card p-2 mb-1"
+                         t-on-click="() => this.startAgent(a)">
+                        <div class="d-flex align-items-center justify-content-between">
+                            <span class="fw-bold text-truncate" t-out="a.name"/>
+                            <span t-if="a.kind === 'coordinator'"
+                                  class="badge text-bg-info ms-1">coord</span>
+                        </div>
+                        <div t-if="a.description" class="small text-muted" t-out="a.description"/>
+                        <div class="small text-muted d-flex flex-wrap gap-2 mt-1">
+                            <span t-if="a.skill"><i class="fa fa-wrench me-1"/><t t-out="a.skill"/></span>
+                            <span t-if="a.persona"><i class="fa fa-user me-1"/><t t-out="a.persona"/></span>
+                            <span t-if="a.model"><i class="fa fa-microchip me-1"/><t t-out="a.model"/></span>
+                            <span t-if="a.supports_attachments"><i class="fa fa-paperclip me-1"/>files</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div t-if="state.mode === 'custom'">
                 <div class="mb-2" t-if="state.connections.length > 1">
                     <label class="form-label small mb-1">Server</label>
                     <select class="form-select form-select-sm"
@@ -65,9 +104,24 @@
                                 t-out="p.display_name"/>
                     </select>
                 </div>
+                <div class="mb-2">
+                    <label class="form-label small mb-1">Model</label>
+                    <input type="text" class="form-control form-control-sm" list="o_ts_models"
+                           placeholder="node default" t-model="state.newSession.model"
+                           t-att-disabled="state.newSession.kind === 'coordinator'"/>
+                    <datalist id="o_ts_models">
+                        <option t-foreach="state.catalog.models" t-as="m" t-key="m" t-att-value="m"/>
+                    </datalist>
+                    <div class="form-text small" t-if="state.newSession.kind === 'coordinator'">
+                        Coordinators always run on the node default — the console create
+                        endpoint takes no model.
+                    </div>
+                </div>
+
                 <button class="btn btn-sm btn-primary w-100" t-on-click="() => this.createSession()">
                     Start
                 </button>
+                </div>
 
                 <!-- Joining work that already exists in Turnstone: a scheduled
                      run, or anything started outside Odoo. -->
@@ -148,7 +202,11 @@
                         <span class="fw-bold" t-out="state.session.name"/>
                         <span class="small text-muted">
                             <t t-out="this.stateLabel(state.session.state)"/>
+                            <t t-if="state.session.agent_name">
+                                · <i class="fa fa-id-badge"/> <t t-out="state.session.agent_name"/>
+                            </t>
                             <t t-if="state.session.skill"> · <t t-out="state.session.skill"/></t>
+                            <t t-if="state.session.persona"> · <t t-out="state.session.persona"/></t>
                             <t t-if="state.session.model"> · <t t-out="state.session.model"/></t>
                             <t t-if="state.session.tool_calls">
                                 · <t t-out="state.session.tool_calls"/> tool calls
@@ -303,6 +361,31 @@
                             <i class="fa fa-external-link me-1"/>
                             <t t-out="this.operationLabel(l.operation)"/>: <t t-out="l.name"/>
                         </button>
+                    </div>
+                </div>
+
+                <div t-if="state.session.supports_attachments" class="o_ts_attachments border-top px-2 pt-2">
+                    <div class="d-flex align-items-center gap-2 flex-wrap">
+                        <label class="btn btn-sm btn-outline-secondary mb-0">
+                            <i class="fa fa-paperclip me-1"/>Attach
+                            <input type="file" multiple="multiple" class="d-none"
+                                   accept="image/*,application/pdf,text/plain,text/csv,application/json"
+                                   t-on-change="(ev) => this.onFilesPicked(ev)"/>
+                        </label>
+                        <span t-if="state.uploading" class="small text-muted">
+                            <i class="fa fa-circle-o-notch fa-spin me-1"/>uploading…
+                        </span>
+                        <span t-foreach="state.attachments" t-as="f" t-key="f.attachment_id"
+                              class="badge text-bg-light d-flex align-items-center gap-1">
+                            <i class="fa"
+                               t-att-class="f.kind === 'image' ? 'fa-image' : (f.kind === 'pdf' ? 'fa-file-pdf-o' : 'fa-file-text-o')"/>
+                            <t t-out="f.filename"/>
+                            <i class="fa fa-times o_ts_chip_x"
+                               t-on-click="() => this.removeAttachment(f.attachment_id)"/>
+                        </span>
+                        <span class="small text-muted ms-auto">
+                            images, PDF, text/CSV/JSON — not xlsx or docx
+                        </span>
                     </div>
                 </div>
 
