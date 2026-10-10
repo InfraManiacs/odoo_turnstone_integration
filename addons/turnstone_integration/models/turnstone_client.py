@@ -280,14 +280,31 @@ class TurnstoneClient:
         )
 
     def approve(self, ws_id, approved, feedback=None, cycle_id=None, kind=None):
+        """Resolve a pending approval.
+
+        A second click on an approval that already landed answers HTTP 409
+        "stale cycle_id". That is not a failure — it means the decision was
+        recorded and the agent has moved on — so it is reported as a no-op
+        rather than raised. Showing the raw 409 tells the user something broke
+        when in fact their click worked the first time.
+        """
         payload = {"approved": bool(approved)}
         if feedback:
             payload["feedback"] = feedback
         if cycle_id:
             payload["cycle_id"] = cycle_id
-        return self._request(
-            "POST", "%s/%s/approve" % (self._ws_prefix(kind), ws_id), payload
-        )
+        try:
+            result = self._request(
+                "POST", "%s/%s/approve" % (self._ws_prefix(kind), ws_id), payload
+            )
+        except TurnstoneError as exc:
+            if "stale cycle_id" in str(exc):
+                _logger.info(
+                    "Approval for %s was already resolved; treating as a no-op", ws_id
+                )
+                return {"already_resolved": True}
+            raise
+        return result or {}
 
     def cancel(self, ws_id, kind=None):
         return self._request("POST", "%s/%s/cancel" % (self._ws_prefix(kind), ws_id), {})

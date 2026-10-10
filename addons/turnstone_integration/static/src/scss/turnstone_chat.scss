@@ -231,3 +231,10 @@
         &:hover { opacity: 1; }
     }
 }
+
+// While an action is in flight, the agent cards must not look clickable —
+// a second start is a second session, not a no-op.
+.o_turnstone_chat .o_ts_agent_card.o_ts_disabled {
+    pointer-events: none;
+    opacity: .6;
+}

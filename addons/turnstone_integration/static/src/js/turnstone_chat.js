@@ -45,6 +45,10 @@ export class TurnstoneChat extends Component {
             mode: "agent",          // "agent" picker, or "custom" full form
             attachments: [],
             uploading: false,
+            // Names the action currently in flight, so its button can lock and
+            // spin. Without this a slow approve invites a second click, and the
+            // second one carries a cycle_id the server has already consumed.
+            busy: null,
             adoptWsId: "",
             isManager: false,
         });
@@ -330,6 +334,27 @@ export class TurnstoneChat extends Component {
         return null;
     }
 
+    /**
+     * Run an action with its button locked.
+     *
+     * Every one of these round-trips to Turnstone and can take seconds. A
+     * button that still looks clickable during that time WILL be clicked again,
+     * and for approvals the second click carries a spent cycle_id and comes
+     * back HTTP 409 "stale cycle_id" — an alarming error for something that
+     * actually worked the first time.
+     */
+    async withBusy(name, fn) {
+        if (this.state.busy) {
+            return;
+        }
+        this.state.busy = name;
+        try {
+            return await fn();
+        } finally {
+            this.state.busy = null;
+        }
+    }
+
     fail(message) {
         this.state.sending = false;
         this.stopPolling();
@@ -408,7 +433,16 @@ export class TurnstoneChat extends Component {
 
     /** Start from a saved agent — the path most users should take. */
     async startAgent(agent) {
-        const res = await rpc("/turnstone/session/new_from_agent", { agent_id: agent.id });
+        if (this.state.busy) {
+            return;
+        }
+        this.state.busy = "agent:" + agent.id;
+        let res;
+        try {
+            res = await rpc("/turnstone/session/new_from_agent", { agent_id: agent.id });
+        } finally {
+            this.state.busy = null;
+        }
         if (res.error) {
             return this.fail(res.error);
         }
@@ -533,29 +567,34 @@ export class TurnstoneChat extends Component {
         if (!this.state.session) {
             return;
         }
-        const res = await rpc("/turnstone/session/approve", {
-            session_id: this.state.session.id,
-            approved,
+        await this.withBusy(approved ? "approve" : "deny", async () => {
+            const res = await rpc("/turnstone/session/approve", {
+                session_id: this.state.session.id,
+                approved,
+            });
+            if (res.error) {
+                return this.fail(res.error);
+            }
+            this.state.session = res.session;
+            this.maybePoll();
         });
-        if (res.error) {
-            return this.fail(res.error);
-        }
-        this.state.session = res.session;
-        this.maybePoll();
     }
 
     async cancelGeneration() {
-        const res = await rpc("/turnstone/session/cancel", {
-            session_id: this.state.session.id,
+        await this.withBusy("stop", async () => {
+            const res = await rpc("/turnstone/session/cancel", {
+                session_id: this.state.session.id,
+            });
+            if (res.error) {
+                return this.fail(res.error);
+            }
+            this.state.session = res.session;
+            this.stopPolling();
         });
-        if (res.error) {
-            return this.fail(res.error);
-        }
-        this.state.session = res.session;
-        this.stopPolling();
     }
 
     async closeSession() {
+        await this.withBusy("close", async () => {
         const res = await rpc("/turnstone/session/close", {
             session_id: this.state.session.id,
         });
@@ -565,28 +604,33 @@ export class TurnstoneChat extends Component {
         this.state.session = null;
         this.state.sessions = res.sessions || [];
         this.stopPolling();
+        });
     }
 
     async retry() {
-        const res = await rpc("/turnstone/session/retry", {
-            session_id: this.state.session.id,
+        await this.withBusy("retry", async () => {
+            const res = await rpc("/turnstone/session/retry", {
+                session_id: this.state.session.id,
+            });
+            if (res.error) {
+                return this.fail(res.error);
+            }
+            this.state.session = res.session;
+            this.maybePoll();
         });
-        if (res.error) {
-            return this.fail(res.error);
-        }
-        this.state.session = res.session;
-        this.maybePoll();
     }
 
     async rewind(turns = 1) {
-        const res = await rpc("/turnstone/session/rewind", {
-            session_id: this.state.session.id,
-            turns,
+        await this.withBusy("rewind", async () => {
+            const res = await rpc("/turnstone/session/rewind", {
+                session_id: this.state.session.id,
+                turns,
+            });
+            if (res.error) {
+                return this.fail(res.error);
+            }
+            this.state.session = res.session;
         });
-        if (res.error) {
-            return this.fail(res.error);
-        }
-        this.state.session = res.session;
     }
 
     /** Attach to a workstream started outside Odoo — a scheduled run, say. */

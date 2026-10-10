@@ -232,9 +232,14 @@ class TurnstoneSession(models.Model):
                     tool_name = items[0].get("func_name") or items[0].get("approval_label")
         except (ValueError, AttributeError, IndexError):
             cycle_id, tool_name = None, None
-        self.connection_id._client().approve(
+        result = self.connection_id._client().approve(
             self.ws_id, approved, feedback=feedback, cycle_id=cycle_id, kind=self.kind
-        )
+        ) or {}
+        if result.get("already_resolved"):
+            # Someone (probably this user, twice) resolved it already. Do not
+            # log a second decision for one approval, and do not claim the
+            # agent is working — just show whatever is actually true now.
+            return self.sync_from_server()
         self.sudo().write({"state": "thinking", "pending_approval_json": "[]"})
         self.env["turnstone.audit.log"].log(
             "tool_approve" if approved else "tool_deny",

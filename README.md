@@ -223,6 +223,14 @@ looking at — you land on a conversation that appears nowhere — and it would 
 make the tree flicker into existence only while you happened to be standing on a
 child.
 
+**Every action that round-trips locks its own button.** These calls take
+seconds, and a button that still looks clickable during that time will be
+clicked again. For approvals the second click carries a `cycle_id` the server
+has already consumed and comes back `HTTP 409 stale cycle_id` — an alarming
+error for something that in fact worked the first time. The button disables and
+spins instead, and a stale cycle is treated as a no-op rather than raised, so a
+double click records one decision and shows the truth.
+
 **The chat stays live for as long as it is open.** Polling only while the agent
 is "thinking" is not enough — an approval can land, a subagent can finish, a
 scheduled job can move, or someone can steer the same session from the Turnstone

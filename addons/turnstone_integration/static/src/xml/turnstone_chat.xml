@@ -37,9 +37,14 @@
                     </div>
                     <div t-foreach="state.agents" t-as="a" t-key="a.id"
                          class="o_ts_agent_card p-2 mb-1"
+                         t-att-class="{ o_ts_disabled: state.busy }"
                          t-on-click="() => this.startAgent(a)">
                         <div class="d-flex align-items-center justify-content-between">
-                            <span class="fw-bold text-truncate" t-out="a.name"/>
+                            <span class="fw-bold text-truncate">
+                                <i t-if="state.busy === 'agent:' + a.id"
+                                   class="fa fa-circle-o-notch fa-spin me-1"/>
+                                <t t-out="a.name"/>
+                            </span>
                             <span t-if="a.kind === 'coordinator'"
                                   class="badge text-bg-info ms-1">coord</span>
                         </div>
@@ -226,22 +231,34 @@
                               title="Started outside Odoo and attached here">attached</span>
                         <button t-if="state.session.state === 'thinking'"
                                 class="btn btn-sm btn-outline-secondary"
+                                t-att-disabled="state.busy"
                                 t-on-click="() => this.cancelGeneration()"
-                                title="Stop the turn in flight">Stop</button>
+                                title="Stop the turn in flight">
+                            <i t-if="state.busy === 'stop'" class="fa fa-circle-o-notch fa-spin me-1"/>
+                            Stop
+                        </button>
                         <button t-if="state.session.state === 'idle'"
                                 class="btn btn-sm btn-outline-secondary"
+                                t-att-disabled="state.busy"
                                 t-on-click="() => this.retry()"
                                 title="Re-run the last message for a different answer">
-                            <i class="fa fa-repeat"/>
+                            <i class="fa"
+                               t-att-class="state.busy === 'retry' ? 'fa-circle-o-notch fa-spin' : 'fa-repeat'"/>
                         </button>
                         <button t-if="state.session.state === 'idle'"
                                 class="btn btn-sm btn-outline-secondary"
+                                t-att-disabled="state.busy"
                                 t-on-click="() => this.rewind(1)"
                                 title="Drop the last turn and take another route">
-                            <i class="fa fa-undo"/>
+                            <i class="fa"
+                               t-att-class="state.busy === 'rewind' ? 'fa-circle-o-notch fa-spin' : 'fa-undo'"/>
                         </button>
                         <button class="btn btn-sm btn-outline-secondary"
-                                t-on-click="() => this.closeSession()">Close</button>
+                                t-att-disabled="state.busy"
+                                t-on-click="() => this.closeSession()">
+                            <i t-if="state.busy === 'close'" class="fa fa-circle-o-notch fa-spin me-1"/>
+                            Close
+                        </button>
                     </div>
                 </header>
 
@@ -306,11 +323,23 @@
                     </div>
                     <div class="font-monospace small" t-out="a.tool"/>
                     <pre t-if="a.preview" class="o_ts_preview small mb-2" t-out="a.preview"/>
-                    <div class="d-flex gap-2">
+                    <div class="d-flex gap-2 align-items-center">
                         <button class="btn btn-sm btn-success"
-                                t-on-click="() => this.resolveApproval(true)">Approve</button>
+                                t-att-disabled="state.busy"
+                                t-on-click="() => this.resolveApproval(true)">
+                            <i t-if="state.busy === 'approve'"
+                               class="fa fa-circle-o-notch fa-spin me-1"/>
+                            Approve
+                        </button>
                         <button class="btn btn-sm btn-outline-danger"
-                                t-on-click="() => this.resolveApproval(false)">Deny</button>
+                                t-att-disabled="state.busy"
+                                t-on-click="() => this.resolveApproval(false)">
+                            <i t-if="state.busy === 'deny'"
+                               class="fa fa-circle-o-notch fa-spin me-1"/>
+                            Deny
+                        </button>
+                        <span t-if="state.busy === 'approve' or state.busy === 'deny'"
+                              class="small text-muted">sending your decision…</span>
                     </div>
                 </div>
 
@@ -399,7 +428,7 @@
                     <div class="d-flex justify-content-between align-items-center mt-1">
                         <span class="small text-muted">Enter to send · Shift+Enter for a new line</span>
                         <button class="btn btn-sm btn-primary"
-                                t-att-disabled="state.sending or !state.draft.trim()"
+                                t-att-disabled="state.sending or state.busy or !state.draft.trim()"
                                 t-on-click="() => this.send()">Send</button>
                     </div>
                 </footer>
