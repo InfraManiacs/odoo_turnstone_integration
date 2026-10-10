@@ -160,9 +160,23 @@
                             <i class="fa fa-shield me-1"/><t t-out="m.body"/>
                         </div>
 
+                        <!-- Tool results are raw JSON and can be enormous. Collapsed
+                             to one line by default: the agent's next turn is the
+                             readable version, and this is here for when you need to
+                             check what it actually saw. -->
                         <t t-elif="m.role === 'tool'">
-                            <div t-if="state.showTools" class="o_ts_tool_result small text-muted">
-                                <i class="fa fa-terminal me-1"/><t t-out="m.body"/>
+                            <div t-if="state.showTools" class="o_ts_tool_result small">
+                                <div class="d-flex align-items-start gap-1 o_ts_tool_head"
+                                     t-on-click="() => this.toggleTool(m.id)">
+                                    <i class="fa"
+                                       t-att-class="state.expandedTools[m.id] ? 'fa-caret-down' : 'fa-caret-right'"/>
+                                    <i class="fa fa-terminal"/>
+                                    <span t-if="!state.expandedTools[m.id]" class="text-truncate flex-grow-1"
+                                          t-out="this.toolSummary(m.body)"/>
+                                    <span t-else="" class="flex-grow-1 text-muted">result</span>
+                                </div>
+                                <pre t-if="state.expandedTools[m.id]" class="o_ts_tool_body"
+                                     t-out="m.body"/>
                             </div>
                         </t>
 

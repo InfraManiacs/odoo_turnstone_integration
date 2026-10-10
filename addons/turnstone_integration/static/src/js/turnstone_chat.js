@@ -40,6 +40,7 @@ export class TurnstoneChat extends Component {
             showTools: true,
             children: [],
             showChildren: false,
+            expandedTools: {},
             adoptWsId: "",
             isManager: false,
         });
@@ -50,29 +51,63 @@ export class TurnstoneChat extends Component {
 
         this.threadRef = useRef("thread");
         this.pollHandle = null;
-        this.pollInterval = 2000;
+        this.pollInterval = 2000;   // while a turn is in flight
+        this.idleInterval = 6000;   // while idle, so external changes still show
+        this.inFlight = false;
+        this.consecutiveFailures = 0;
+        this.hidden = false;
+
+        // A background tab should not keep polling, but coming back to it
+        // should feel instant rather than waiting out the next interval.
+        this.onVisibility = () => {
+            this.hidden = document.hidden;
+            if (this.hidden) {
+                this.stopPolling();
+            } else {
+                this.stopPolling();
+                this.tick();
+            }
+        };
+        document.addEventListener("visibilitychange", this.onVisibility);
 
         onWillStart(async () => {
             await this.bootstrap();
+            // Keep the sidebar live even before a session is opened, so a job
+            // that starts elsewhere shows up without a manual reload.
+            this.maybePoll();
             const requested = this.props.action?.params?.session_id;
             if (requested) {
                 await this.openSession(requested);
             }
         });
 
-        onWillUnmount(() => this.stopPolling());
+        onWillUnmount(() => {
+            this.stopPolling();
+            document.removeEventListener("visibilitychange", this.onVisibility);
+        });
 
         // Keep the newest turn in view, but only when the transcript actually
         // grew — otherwise every poll yanks the scroll position back down while
         // someone is reading earlier output.
+        // Scroll on new turns AND when the last turn grows — an agent's final
+        // message arrives in one poll as a large block, which would otherwise
+        // land below the fold.
         useEffect(
-            (count) => {
-                if (count !== this._lastCount) {
-                    this._lastCount = count;
+            (count, lastLen, state) => {
+                const sig = `${count}:${lastLen}:${state}`;
+                if (sig !== this._lastSig) {
+                    this._lastSig = sig;
                     this.scrollToBottom();
                 }
             },
-            () => [this.state.session?.messages?.length ?? 0]
+            () => {
+                const msgs = this.state.session?.messages ?? [];
+                return [
+                    msgs.length,
+                    msgs.length ? (msgs[msgs.length - 1].body || "").length : 0,
+                    this.state.session?.state ?? "",
+                ];
+            }
         );
     }
 
@@ -89,6 +124,7 @@ export class TurnstoneChat extends Component {
         this.state.sessions = res.sessions || [];
         this.state.showTools = res.show_tool_calls !== false;
         this.state.isManager = !!res.is_manager;
+        this.idleInterval = Math.max(this.pollInterval * 3, 5000);
         this.pollInterval = res.poll_interval || 2000;
         this.state.newSession.connection_id =
             (this.state.connections.find((c) => c.is_default) || this.state.connections[0])?.id ??
@@ -122,29 +158,85 @@ export class TurnstoneChat extends Component {
         }
     }
 
-    /** Poll only while the agent is actually working. */
+    /**
+     * Keep the view live for as long as it is open.
+     *
+     * Polling only while the agent is "thinking" is not enough: an approval can
+     * land, a subagent can finish, a scheduled job can move, or someone can
+     * steer the same session from the Turnstone console — all while this session
+     * reads as idle. So the loop runs continuously and only changes pace.
+     *
+     * Turnstone does expose SSE, but the API token must stay server-side, so
+     * streaming would mean holding an Odoo worker open per viewer. Adaptive
+     * polling through the existing proxy is the honest trade here.
+     */
+    pollDelay() {
+        const s = this.state.session;
+        if (!s) {
+            return this.idleInterval;
+        }
+        if (s.state === "thinking") {
+            return this.pollInterval;        // mid-turn: keep up with output
+        }
+        if (s.state === "attention") {
+            return this.pollInterval * 2;    // someone is being waited on
+        }
+        if (s.state === "closed") {
+            return 0;                        // nothing more will happen
+        }
+        return this.idleInterval;            // idle, but still watch for changes
+    }
+
     maybePoll() {
         this.stopPolling();
-        const s = this.state.session;
-        if (!s || s.state !== "thinking") {
+        if (this.hidden) {
+            return;  // resumed by the visibilitychange handler
+        }
+        const delay = this.pollDelay();
+        if (!delay) {
             return;
         }
-        this.pollHandle = setTimeout(async () => {
-            if (!this.state.session) {
-                return;
-            }
+        this.pollHandle = setTimeout(() => this.tick(), delay);
+    }
+
+    async tick() {
+        if (this.hidden) {
+            return this.maybePoll();
+        }
+        if (!this.state.session) {
+            // No session open: still keep the sidebar current, so work started
+            // elsewhere (a schedule, another tab) appears on its own.
+            await this.refreshSidebar();
+            return this.maybePoll();
+        }
+        if (this.inFlight) {
+            // A slow sync must not stack requests behind itself.
+            return this.maybePoll();
+        }
+        this.inFlight = true;
+        try {
             const res = await rpc("/turnstone/session/get", {
                 session_id: this.state.session.id,
                 sync: true,
             });
             if (res.error) {
-                return this.fail(res.error);
+                this.consecutiveFailures++;
+                // Transient server or network trouble should not clear the
+                // conversation or spam a toast on every tick.
+                if (this.consecutiveFailures >= 3) {
+                    this.fail(res.error);
+                    this.consecutiveFailures = 0;
+                }
+                return;
             }
+            this.consecutiveFailures = 0;
             this.state.session = res.session;
-            await this.refreshSidebar();
             this.loadChildren();
+            await this.refreshSidebar();
+        } finally {
+            this.inFlight = false;
             this.maybePoll();
-        }, this.pollInterval);
+        }
     }
 
     stopPolling() {
@@ -353,6 +445,16 @@ export class TurnstoneChat extends Component {
             }
         }
         return this._mdCache.get(key);
+    }
+
+    toggleTool(messageId) {
+        this.state.expandedTools[messageId] = !this.state.expandedTools[messageId];
+    }
+
+    /** First line of a tool result, for the collapsed summary. */
+    toolSummary(body) {
+        const first = (body || "").split("\n").find((l) => l.trim()) || "";
+        return first.length > 110 ? first.slice(0, 110) + "\u2026" : first;
     }
 
     stateBadge(state) {

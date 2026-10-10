@@ -119,6 +119,19 @@ independent layer. This text is written by a model that reads untrusted input �
 pod logs, email bodies, web pages — so "the agent would not emit a script tag"
 is not a security argument.
 
+**The chat stays live for as long as it is open.** Polling only while the agent
+is "thinking" is not enough — an approval can land, a subagent can finish, a
+scheduled job can move, or someone can steer the same session from the Turnstone
+console, all while this session reads as idle. The loop runs continuously and
+only changes pace: fast mid-turn, slower when idle, stopped when the tab is
+hidden and resumed immediately when it comes back. Requests never stack behind a
+slow sync, and a transient failure has to happen three times before it bothers
+the user.
+
+Turnstone does expose SSE, and it is tempting. But the API token must stay
+server-side, so streaming would mean holding an Odoo worker open per viewer.
+Adaptive polling through the existing proxy is the honest trade at this scale.
+
 **Linked records are parsed from the transcript**, because the agent's writes
 reach Odoo over JSON-RPC through the Odoo MCP server — Odoo has no idea they came
 from an agent. A tool call to `mcp__odoo__odoo_create` names the model, and the
@@ -164,7 +177,8 @@ database password and mounts the addon read-write.
 
 ## Status
 
-Exercised end to end against a live Turnstone, including:
+Exercised end to end against a live Turnstone **and driven in a real browser**,
+including:
 
 - chat with an agent that ran real cluster tools and answered
 - adopting a coordinator started **outside** Odoo, watching it spawn two
@@ -172,6 +186,10 @@ Exercised end to end against a live Turnstone, including:
 - Live Activity listing 19 workstreams across the cluster, correctly marking
   which ones Odoo already knows
 - the permission matrix above, as a non-manager user
+- in the browser: Markdown tables, lists, bold and inline code rendering from a
+  real agent reply; live status moving Working -> Ready in both the header and
+  the sidebar with no interaction; collapsed tool results; and the linked-record
+  chip opening `res.partner` with the breadcrumb intact
 
 Not yet done:
 - The agent-writes-to-Odoo round trip is tested against synthetic transcripts
@@ -179,6 +197,4 @@ Not yet done:
   cannot reach a laptop.
 - Polling, not streaming. Turnstone exposes SSE; this polls while an agent works.
 - No automated test suite; the verification above was driven by hand.
-- The UI has not been looked at in a browser — the Chrome extension was not
-  connected during development. Templates are cross-checked against components
-  statically, which catches unresolved references but not layout.
+- Polling rather than streaming (see above).

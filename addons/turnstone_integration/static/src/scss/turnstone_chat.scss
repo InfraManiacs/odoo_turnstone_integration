@@ -166,3 +166,40 @@
 .o_turnstone_chat .o_ts_child_done {
     opacity: .6;
 }
+
+.o_turnstone_chat {
+    .o_ts_tool_head {
+        cursor: pointer;
+        opacity: .7;
+        &:hover { opacity: 1; }
+    }
+    .o_ts_tool_body {
+        white-space: pre-wrap;
+        word-break: break-all;
+        background-color: rgba(0, 0, 0, .05);
+        border-radius: .25rem;
+        padding: .4rem .6rem;
+        margin: .25rem 0 0 1.1rem;
+        max-height: 18rem;
+        overflow: auto;
+        font-size: .78rem;
+    }
+}
+
+// The conversation is the only part that may shrink.
+//
+// Without this, flex squeezes the panels below the thread — the linked-records
+// strip collapsed to 30px, showing its "Records this agent touched" heading
+// with the chips scrolled out of sight, which reads as a bug rather than as
+// something to scroll.
+.o_turnstone_chat {
+    .o_ts_thread { flex: 1 1 auto; min-height: 0; }
+
+    .o_ts_children,
+    .o_ts_links,
+    .o_ts_approval,
+    .o_ts_composer,
+    .o_ts_header { flex: 0 0 auto; }
+
+    .o_ts_links { max-height: 9rem; }
+}
