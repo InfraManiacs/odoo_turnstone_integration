@@ -119,6 +119,18 @@ independent layer. This text is written by a model that reads untrusted input �
 pod logs, email bodies, web pages — so "the agent would not emit a script tag"
 is not a security argument.
 
+**A subagent is a session you can walk into and back out of.** The chat keeps a
+navigation stack, so opening a subagent shows a back link to where you came
+from; picking something from the sidebar instead clears it, because that is a
+jump rather than a descent.
+
+The sidebar nests subagents under their parent and keeps them there whatever
+their state. Both halves matter: a coordinator closes its children when it
+finishes, so a plain "state != closed" list drops the very session you are
+looking at — you land on a conversation that appears nowhere — and it would also
+make the tree flicker into existence only while you happened to be standing on a
+child.
+
 **The chat stays live for as long as it is open.** Polling only while the agent
 is "thinking" is not enough — an approval can land, a subagent can finish, a
 scheduled job can move, or someone can steer the same session from the Turnstone
@@ -190,6 +202,9 @@ including:
   real agent reply; live status moving Working -> Ready in both the header and
   the sidebar with no interaction; collapsed tool results; and the linked-record
   chip opening `res.partner` with the breadcrumb intact
+- in the browser: walking parent -> subagent -> back -> other subagent -> back,
+  with the sidebar tree stable throughout and the panel buttons correctly
+  reading "open" for an attached subagent and "attach" for a new one
 
 Not yet done:
 - The agent-writes-to-Odoo round trip is tested against synthetic transcripts

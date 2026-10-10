@@ -49,7 +49,7 @@ class TurnstoneController(http.Controller):
     # -- catalogue ---------------------------------------------------------
 
     @http.route("/turnstone/bootstrap", type="jsonrpc", auth="user")
-    def bootstrap(self):
+    def bootstrap(self, current_session_id=None):
         """Everything the client needs to render before the user does anything."""
         try:
             self._require_user()
@@ -71,7 +71,7 @@ class TurnstoneController(http.Controller):
                     }
                     for c in usable
                 ],
-                "sessions": self._session_list(),
+                "sessions": self._session_list(include_id=current_session_id),
                 "is_manager": request.env.user.has_group(
                     "turnstone_integration.group_turnstone_manager"
                 ),
@@ -85,16 +85,42 @@ class TurnstoneController(http.Controller):
         except (UserError, AccessError) as exc:
             return self._error(exc)
 
-    def _session_list(self):
-        sessions = request.env["turnstone.session"].search(
-            [("state", "!=", "closed")], limit=50
-        )
+    def _session_list(self, include_id=None):
+        """Sessions for the sidebar.
+
+        `include_id` is never optional in practice: a subagent is usually
+        CLOSED by the time you open it — a coordinator calls close_all_children
+        when it is done — so a plain "state != closed" list drops the very
+        session the user is looking at, stranding them on a conversation that
+        appears nowhere.
+        """
+        Session = request.env["turnstone.session"]
+        domain = [("state", "!=", "closed")]
+        if include_id:
+            domain = ["|", ("id", "=", int(include_id))] + domain
+        sessions = Session.search(domain, limit=60)
+
+        # Pull in subagents of everything listed, whatever their state. A
+        # coordinator closes its children when it is done, so filtering them out
+        # would make the tree appear only while you happen to be standing on a
+        # child — it would vanish the moment you went back to the parent.
+        parent_ws = [s.ws_id for s in sessions if s.ws_id]
+        if parent_ws:
+            children = Session.search([
+                ("parent_ws_id", "in", parent_ws),
+                ("id", "not in", sessions.ids),
+            ], limit=60)
+            sessions |= children
         return [
             {
                 "id": s.id,
                 "name": s.name,
                 "state": s.state,
                 "skill": s.skill or None,
+                "kind": s.kind,
+                "ws_id": s.ws_id or None,
+                "parent_ws_id": s.parent_ws_id or None,
+                "adopted": s.adopted,
                 "has_pending_approval": s.has_pending_approval,
                 "last_activity": s.last_activity and s.last_activity.isoformat(),
                 "connection_name": s.connection_id.name,
@@ -162,7 +188,10 @@ class TurnstoneController(http.Controller):
             # The workstream itself is created lazily on the first message, so
             # opening the composer and changing your mind costs nothing on the
             # Turnstone side.
-            return {"session": session._as_dict(), "sessions": self._session_list()}
+            return {
+                "session": session._as_dict(),
+                "sessions": self._session_list(include_id=session.id),
+            }
         except (UserError, AccessError) as exc:
             return self._error(exc)
 
@@ -181,7 +210,10 @@ class TurnstoneController(http.Controller):
         try:
             session = self._session(session_id)
             session.check_access("write")
-            return {"session": session.action_send(body), "sessions": self._session_list()}
+            return {
+                "session": session.action_send(body),
+                "sessions": self._session_list(include_id=session.id),
+            }
         except (UserError, AccessError) as exc:
             return self._error(exc)
 
@@ -266,7 +298,10 @@ class TurnstoneController(http.Controller):
         try:
             self._require_user()
             session = request.env["turnstone.session"].adopt(connection_id, ws_id, name=name)
-            return {"session": session._as_dict(), "sessions": self._session_list()}
+            return {
+                "session": session._as_dict(),
+                "sessions": self._session_list(include_id=session.id),
+            }
         except (UserError, AccessError) as exc:
             return self._error(exc)
 

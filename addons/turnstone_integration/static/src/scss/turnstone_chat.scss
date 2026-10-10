@@ -203,3 +203,11 @@
 
     .o_ts_links { max-height: 9rem; }
 }
+
+.o_turnstone_chat .o_ts_back {
+    font-size: .78rem;
+    line-height: 1.1;
+    text-decoration: none;
+    opacity: .75;
+    &:hover { opacity: 1; text-decoration: underline; }
+}

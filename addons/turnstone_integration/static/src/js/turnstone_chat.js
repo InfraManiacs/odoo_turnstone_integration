@@ -56,6 +56,9 @@ export class TurnstoneChat extends Component {
         this.inFlight = false;
         this.consecutiveFailures = 0;
         this.hidden = false;
+        // Where "back" goes, so descending into a subagent and returning is one
+        // click rather than hunting the parent in the sidebar.
+        this.navStack = [];
 
         // A background tab should not keep polling, but coming back to it
         // should feel instant rather than waiting out the next interval.
@@ -132,7 +135,10 @@ export class TurnstoneChat extends Component {
         this.state.loading = false;
     }
 
-    async openSession(sessionId) {
+    async openSession(sessionId, { push = false } = {}) {
+        if (push && this.state.session && this.state.session.id !== sessionId) {
+            this.navStack.push({ id: this.state.session.id, name: this.state.session.name });
+        }
         this.stopPolling();
         const res = await rpc("/turnstone/session/get", { session_id: sessionId, sync: true });
         if (res.error) {
@@ -247,10 +253,72 @@ export class TurnstoneChat extends Component {
     }
 
     async refreshSidebar() {
-        const res = await rpc("/turnstone/bootstrap", {});
+        const res = await rpc("/turnstone/bootstrap", {
+            current_session_id: this.state.session?.id,
+        });
         if (!res.error) {
             this.state.sessions = res.sessions || [];
         }
+    }
+
+    /**
+     * Sidebar rows, with subagents nested under the parent they belong to.
+     *
+     * A subagent opened from the panel is a session like any other, but showing
+     * it as a flat peer of its own parent loses the only thing that explains
+     * why it exists.
+     */
+    get sessionTree() {
+        const rows = this.state.sessions || [];
+        const byWs = new Map(rows.filter((r) => r.ws_id).map((r) => [r.ws_id, r]));
+        const kids = new Map();
+        const roots = [];
+        for (const r of rows) {
+            if (r.parent_ws_id && byWs.has(r.parent_ws_id)) {
+                if (!kids.has(r.parent_ws_id)) {
+                    kids.set(r.parent_ws_id, []);
+                }
+                kids.get(r.parent_ws_id).push(r);
+            } else {
+                roots.push(r);
+            }
+        }
+        const out = [];
+        const walk = (row, depth) => {
+            out.push({ ...row, depth });
+            for (const k of kids.get(row.ws_id) || []) {
+                walk(k, depth + 1);
+            }
+        };
+        roots.forEach((r) => walk(r, 0));
+        return out;
+    }
+
+    /** Choosing from the sidebar is a jump, not a descent. */
+    async pickSession(sessionId) {
+        this.navStack = [];
+        await this.openSession(sessionId);
+    }
+
+    /** Back to the session we came from, or to this one's parent. */
+    async goBack() {
+        const target = this.backTarget;
+        if (!target) {
+            return;
+        }
+        this.navStack.pop();
+        await this.openSession(target.id, { push: false });
+    }
+
+    get backTarget() {
+        if (this.navStack.length) {
+            return this.navStack[this.navStack.length - 1];
+        }
+        const s = this.state.session;
+        if (s && s.parent_session_id) {
+            return { id: s.parent_session_id, name: s.parent_name };
+        }
+        return null;
     }
 
     fail(message) {
@@ -403,10 +471,17 @@ export class TurnstoneChat extends Component {
 
     /** Open a subagent: adopt it if Odoo has never seen it, else just switch. */
     async openChild(child) {
+        const from = this.state.session
+            ? { id: this.state.session.id, name: this.state.session.name }
+            : null;
         if (child.odoo_session_id) {
-            await this.openSession(child.odoo_session_id);
-        } else {
-            await this.adopt(child.ws_id);
+            await this.openSession(child.odoo_session_id, { push: true });
+            return;
+        }
+        await this.adopt(child.ws_id);
+        // adopt() replaces the session wholesale, so record the origin after it.
+        if (from && this.state.session && this.state.session.id !== from.id) {
+            this.navStack.push(from);
         }
     }
 

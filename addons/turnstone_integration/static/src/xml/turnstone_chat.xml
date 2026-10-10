@@ -70,17 +70,23 @@
                 <div t-if="!state.sessions.length" class="text-muted small p-3">
                     No sessions yet.
                 </div>
-                <div t-foreach="state.sessions" t-as="s" t-key="s.id"
+                <div t-foreach="this.sessionTree" t-as="s" t-key="s.id"
                      class="o_ts_session_item p-2 border-bottom"
                      t-att-class="{ 'o_ts_active': state.session and state.session.id === s.id }"
-                     t-on-click="() => this.openSession(s.id)">
+                     t-att-style="s.depth ? 'padding-left:' + (8 + s.depth * 14) + 'px' : ''"
+                     t-on-click="() => this.pickSession(s.id)">
                     <div class="d-flex align-items-center justify-content-between">
-                        <span class="text-truncate" t-out="s.name"/>
+                        <span class="text-truncate">
+                            <i t-if="s.depth" class="fa fa-level-up fa-rotate-90 text-muted me-1"
+                               title="Subagent"/>
+                            <t t-out="s.name"/>
+                        </span>
                         <span t-if="s.has_pending_approval" class="badge text-bg-warning ms-1"
                               title="Waiting for your approval">!</span>
                     </div>
                     <div class="small text-muted d-flex gap-2">
                         <span t-out="this.stateLabel(s.state)"/>
+                        <span t-if="s.kind === 'coordinator'" class="badge text-bg-light">coord</span>
                         <span t-if="s.skill" class="text-truncate" t-out="s.skill"/>
                     </div>
                 </div>
@@ -111,6 +117,14 @@
             <t t-else="">
                 <header class="o_ts_header d-flex align-items-center justify-content-between p-2 border-bottom">
                     <div class="d-flex flex-column">
+                        <!-- Where you came from. A subagent is usually CLOSED by the
+                             time you open it, so without this you land on a
+                             conversation with no obvious way back. -->
+                        <button t-if="this.backTarget" class="btn btn-link btn-sm p-0 text-start o_ts_back"
+                                t-on-click="() => this.goBack()">
+                            <i class="fa fa-angle-left me-1"/>
+                            <t t-out="this.backTarget.name"/>
+                        </button>
                         <span class="fw-bold" t-out="state.session.name"/>
                         <span class="small text-muted">
                             <t t-out="this.stateLabel(state.session.state)"/>

@@ -646,9 +646,32 @@ class TurnstoneSession(models.Model):
 
     # -- serialisation for the chat client ---------------------------------
 
+    def _parent_session(self):
+        """The Odoo session mirroring this one's parent workstream, if we have it."""
+        self.ensure_one()
+        if not self.parent_ws_id:
+            return self.browse()
+        return self.sudo().search([
+            ("ws_id", "=", self.parent_ws_id),
+            ("connection_id", "=", self.connection_id.id),
+        ], limit=1)
+
     def _as_dict(self):
         self.ensure_one()
         rec = self.sudo()
+        parent = rec._parent_session()
+        # Which subagents Odoo already mirrors, so the panel can offer "open"
+        # rather than "attach" and avoid a needless round trip.
+        subagent_sessions = {}
+        sub_ws = [s.ws_id for s in rec.subagent_ids if s.ws_id]
+        if sub_ws:
+            subagent_sessions = {
+                s.ws_id: s.id
+                for s in rec.search([
+                    ("ws_id", "in", sub_ws),
+                    ("connection_id", "=", rec.connection_id.id),
+                ])
+            }
         try:
             pending = json.loads(rec.pending_approval_json or "[]")
         except ValueError:
@@ -666,6 +689,10 @@ class TurnstoneSession(models.Model):
             "node_id": rec.node_id or None,
             "kind": rec.kind,
             "parent_ws_id": rec.parent_ws_id or None,
+            # So the chat can offer a way back rather than stranding the user
+            # on a subagent that is not in the sidebar.
+            "parent_session_id": parent.id if parent else None,
+            "parent_name": parent.name if parent else None,
             "adopted": rec.adopted,
             "activity": rec.activity or "",
             "activity_state": rec.activity_state or "",
@@ -687,6 +714,7 @@ class TurnstoneSession(models.Model):
             "subagents": [
                 {
                     "ws_id": sub.ws_id,
+                    "odoo_session_id": subagent_sessions.get(sub.ws_id),
                     "name": sub.name or sub.ws_id[:12],
                     "state": "done" if sub.gone else (sub.state or "unknown"),
                     "kind": sub.kind,
