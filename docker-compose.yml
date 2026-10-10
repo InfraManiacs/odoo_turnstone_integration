@@ -1,0 +1,50 @@
+# Local Odoo 19 for developing turnstone_integration.
+#
+# Development only. It binds a host port, uses a trivial database password and
+# mounts the addon read-write so you can edit and reload — none of which belongs
+# anywhere near a real deployment.
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: odoo
+      POSTGRES_PASSWORD: odoo
+      POSTGRES_DB: postgres
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - db-data:/var/lib/postgresql/data/pgdata
+    healthcheck:
+      # Odoo's entrypoint does not wait for Postgres, and a cold volume takes
+      # long enough to initialise that Odoo loses the race and exits.
+      test: ["CMD-SHELL", "pg_isready -U odoo -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  odoo:
+    image: odoo:19.0-20260926
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${ODOO_PORT:-8069}:8069"
+      # Longpolling / websocket. The chat UI polls over normal HTTP, so this is
+      # only needed if you enable Odoo's own bus for anything.
+      - "${ODOO_LONGPOLL_PORT:-8072}:8072"
+    environment:
+      HOST: db
+      USER: odoo
+      PASSWORD: odoo
+    volumes:
+      - odoo-data:/var/lib/odoo
+      - ./addons:/mnt/extra-addons:rw
+      - ./config:/etc/odoo:ro
+    command: >
+      odoo
+      --config=/etc/odoo/odoo.conf
+      --database=turnstone
+      --dev=reload,qweb,xml
+
+volumes:
+  db-data:
+  odoo-data:

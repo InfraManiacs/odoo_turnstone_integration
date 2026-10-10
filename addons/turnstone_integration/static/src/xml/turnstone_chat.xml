@@ -1,0 +1,201 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates xml:space="preserve">
+
+<t t-name="turnstone_integration.TurnstoneChat">
+    <div class="o_turnstone_chat d-flex h-100">
+
+        <!-- Sessions -->
+        <aside class="o_ts_sidebar d-flex flex-column border-end">
+            <div class="o_ts_sidebar_head d-flex align-items-center justify-content-between p-2 border-bottom">
+                <span class="fw-bold">Sessions</span>
+                <button class="btn btn-sm btn-primary" t-on-click="() => this.toggleNewForm()"
+                        title="Start a new session">
+                    <i class="fa fa-plus"/>
+                </button>
+            </div>
+
+            <div t-if="state.showNewForm" class="o_ts_new_form p-2 border-bottom">
+                <div class="mb-2" t-if="state.connections.length > 1">
+                    <label class="form-label small mb-1">Server</label>
+                    <select class="form-select form-select-sm"
+                            t-model.number="state.newSession.connection_id">
+                        <option t-foreach="state.connections" t-as="c" t-key="c.id"
+                                t-att-value="c.id" t-out="c.name"/>
+                    </select>
+                </div>
+                <div class="mb-2">
+                    <label class="form-label small mb-1">Name</label>
+                    <input type="text" class="form-control form-control-sm"
+                           placeholder="Optional" t-model="state.newSession.name"/>
+                </div>
+                <div class="mb-2" t-if="state.catalog.skills.length">
+                    <label class="form-label small mb-1">Skill</label>
+                    <select class="form-select form-select-sm" t-model="state.newSession.skill">
+                        <option value="">Server default</option>
+                        <option t-foreach="state.catalog.skills" t-as="s" t-key="s.name"
+                                t-att-value="s.name" t-att-title="s.description" t-out="s.name"/>
+                    </select>
+                </div>
+                <div class="mb-2" t-if="state.catalog.personas.length">
+                    <label class="form-label small mb-1">Persona</label>
+                    <select class="form-select form-select-sm" t-model="state.newSession.persona">
+                        <option value="">Default</option>
+                        <option t-foreach="state.catalog.personas" t-as="p" t-key="p.name"
+                                t-att-value="p.name" t-att-title="p.description"
+                                t-out="p.display_name"/>
+                    </select>
+                </div>
+                <button class="btn btn-sm btn-primary w-100" t-on-click="() => this.createSession()">
+                    Start
+                </button>
+            </div>
+
+            <div class="o_ts_session_list flex-grow-1 overflow-auto">
+                <div t-if="!state.sessions.length" class="text-muted small p-3">
+                    No sessions yet.
+                </div>
+                <div t-foreach="state.sessions" t-as="s" t-key="s.id"
+                     class="o_ts_session_item p-2 border-bottom"
+                     t-att-class="{ 'o_ts_active': state.session and state.session.id === s.id }"
+                     t-on-click="() => this.openSession(s.id)">
+                    <div class="d-flex align-items-center justify-content-between">
+                        <span class="text-truncate" t-out="s.name"/>
+                        <span t-if="s.has_pending_approval" class="badge text-bg-warning ms-1"
+                              title="Waiting for your approval">!</span>
+                    </div>
+                    <div class="small text-muted d-flex gap-2">
+                        <span t-out="this.stateLabel(s.state)"/>
+                        <span t-if="s.skill" class="text-truncate" t-out="s.skill"/>
+                    </div>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Conversation -->
+        <section class="o_ts_main d-flex flex-column flex-grow-1">
+
+            <div t-if="state.loading" class="p-4 text-muted">Loading…</div>
+
+            <div t-elif="state.error" class="alert alert-danger m-3">
+                <strong>Turnstone is not reachable.</strong>
+                <div t-out="state.error"/>
+            </div>
+
+            <div t-elif="!state.connections.length" class="alert alert-info m-3">
+                <strong>No Turnstone server configured.</strong>
+                <div>Ask a Turnstone Administrator to add one under Settings → Turnstone.</div>
+            </div>
+
+            <div t-elif="!state.session"
+                 class="d-flex flex-column align-items-center justify-content-center h-100 text-muted">
+                <i class="fa fa-comments fa-2x mb-2"/>
+                <div>Pick a session, or start a new one.</div>
+            </div>
+
+            <t t-else="">
+                <header class="o_ts_header d-flex align-items-center justify-content-between p-2 border-bottom">
+                    <div class="d-flex flex-column">
+                        <span class="fw-bold" t-out="state.session.name"/>
+                        <span class="small text-muted">
+                            <t t-out="this.stateLabel(state.session.state)"/>
+                            <t t-if="state.session.skill"> · <t t-out="state.session.skill"/></t>
+                            <t t-if="state.session.model"> · <t t-out="state.session.model"/></t>
+                            <t t-if="state.session.tool_calls">
+                                · <t t-out="state.session.tool_calls"/> tool calls
+                            </t>
+                            <t t-if="state.session.context_ratio">
+                                · <t t-out="this.contextPercent"/>% context
+                            </t>
+                        </span>
+                    </div>
+                    <div class="d-flex gap-1">
+                        <button t-if="state.session.state === 'thinking'"
+                                class="btn btn-sm btn-outline-secondary"
+                                t-on-click="() => this.cancelGeneration()">Stop</button>
+                        <button class="btn btn-sm btn-outline-secondary"
+                                t-on-click="() => this.closeSession()">Close</button>
+                    </div>
+                </header>
+
+                <div class="o_ts_thread flex-grow-1 overflow-auto p-3" t-ref="thread">
+                    <div t-foreach="state.session.messages" t-as="m" t-key="m.id"
+                         class="o_ts_msg mb-3" t-att-class="'o_ts_' + m.role">
+
+                        <div t-if="m.is_guard_notice" class="o_ts_guard small">
+                            <i class="fa fa-shield me-1"/><t t-out="m.body"/>
+                        </div>
+
+                        <t t-elif="m.role === 'tool'">
+                            <div t-if="state.showTools" class="o_ts_tool_result small text-muted">
+                                <i class="fa fa-terminal me-1"/><t t-out="m.body"/>
+                            </div>
+                        </t>
+
+                        <t t-else="">
+                            <div t-if="m.tool_names and state.showTools"
+                                 class="o_ts_tool_calls small text-muted mb-1">
+                                <i class="fa fa-cog me-1"/><t t-out="m.tool_names"/>
+                            </div>
+                            <div t-if="m.body" class="o_ts_bubble">
+                                <div class="o_ts_role small text-muted mb-1">
+                                    <t t-out="m.role === 'user' ? 'You' : 'Agent'"/>
+                                </div>
+                                <div class="o_ts_body" t-out="m.body"/>
+                            </div>
+                        </t>
+                    </div>
+
+                    <div t-if="state.session.state === 'thinking'" class="text-muted small">
+                        <i class="fa fa-circle-o-notch fa-spin me-1"/>Working…
+                    </div>
+                </div>
+
+                <!-- Approvals -->
+                <div t-foreach="state.session.pending_approvals" t-as="a" t-key="a.call_id"
+                     class="o_ts_approval alert alert-warning m-2">
+                    <div class="fw-bold">
+                        <i class="fa fa-hand-paper-o me-1"/>Approval needed
+                    </div>
+                    <div class="font-monospace small" t-out="a.tool"/>
+                    <pre t-if="a.preview" class="o_ts_preview small mb-2" t-out="a.preview"/>
+                    <div class="d-flex gap-2">
+                        <button class="btn btn-sm btn-success"
+                                t-on-click="() => this.resolveApproval(true)">Approve</button>
+                        <button class="btn btn-sm btn-outline-danger"
+                                t-on-click="() => this.resolveApproval(false)">Deny</button>
+                    </div>
+                </div>
+
+                <!-- What the agent touched in Odoo -->
+                <div t-if="state.session.linked_records.length"
+                     class="o_ts_links border-top p-2">
+                    <div class="small text-muted mb-1">Records this agent touched</div>
+                    <div class="d-flex flex-wrap gap-1">
+                        <button t-foreach="state.session.linked_records" t-as="l" t-key="l.id"
+                                class="btn btn-sm btn-outline-primary"
+                                t-on-click="() => this.openLinkedRecord(l)">
+                            <i class="fa fa-external-link me-1"/>
+                            <t t-out="this.operationLabel(l.operation)"/>: <t t-out="l.name"/>
+                        </button>
+                    </div>
+                </div>
+
+                <footer class="o_ts_composer border-top p-2">
+                    <textarea class="form-control" rows="2"
+                              placeholder="Ask the agent to do something…"
+                              t-model="state.draft"
+                              t-on-keydown="(ev) => this.onKeydown(ev)"
+                              t-att-disabled="state.session.state === 'closed'"/>
+                    <div class="d-flex justify-content-between align-items-center mt-1">
+                        <span class="small text-muted">Enter to send · Shift+Enter for a new line</span>
+                        <button class="btn btn-sm btn-primary"
+                                t-att-disabled="state.sending or !state.draft.trim()"
+                                t-on-click="() => this.send()">Send</button>
+                    </div>
+                </footer>
+            </t>
+        </section>
+    </div>
+</t>
+
+</templates>

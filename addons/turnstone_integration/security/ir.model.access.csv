@@ -1,0 +1,9 @@
+id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink
+access_turnstone_connection_user,turnstone.connection user,model_turnstone_connection,group_turnstone_user,1,0,0,0
+access_turnstone_connection_manager,turnstone.connection manager,model_turnstone_connection,group_turnstone_manager,1,1,1,1
+access_turnstone_session_user,turnstone.session user,model_turnstone_session,group_turnstone_user,1,1,1,1
+access_turnstone_session_manager,turnstone.session manager,model_turnstone_session,group_turnstone_manager,1,1,1,1
+access_turnstone_message_user,turnstone.message user,model_turnstone_message,group_turnstone_user,1,0,0,0
+access_turnstone_message_manager,turnstone.message manager,model_turnstone_message,group_turnstone_manager,1,1,1,1
+access_turnstone_linked_record_user,turnstone.linked.record user,model_turnstone_linked_record,group_turnstone_user,1,0,0,0
+access_turnstone_linked_record_manager,turnstone.linked.record manager,model_turnstone_linked_record,group_turnstone_manager,1,1,1,1

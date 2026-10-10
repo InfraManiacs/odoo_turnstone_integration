@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <record id="view_turnstone_connection_list" model="ir.ui.view">
+        <field name="name">turnstone.connection.list</field>
+        <field name="model">turnstone.connection</field>
+        <field name="arch" type="xml">
+            <list string="Turnstone Servers">
+                <field name="sequence" widget="handle"/>
+                <field name="name"/>
+                <field name="base_url"/>
+                <field name="is_default"/>
+                <field name="session_count" string="Sessions"/>
+                <field name="status_ok" string="Reachable" widget="boolean_toggle" readonly="1"/>
+                <field name="company_id" groups="base.group_multi_company"/>
+            </list>
+        </field>
+    </record>
+
+    <record id="view_turnstone_connection_form" model="ir.ui.view">
+        <field name="name">turnstone.connection.form</field>
+        <field name="model">turnstone.connection</field>
+        <field name="arch" type="xml">
+            <form string="Turnstone Server">
+                <header>
+                    <button name="action_test_connection" type="object" string="Test Connection"
+                            class="btn-primary"/>
+                </header>
+                <sheet>
+                    <div class="oe_button_box" name="button_box">
+                        <button name="action_view_sessions" type="object" class="oe_stat_button"
+                                icon="fa-comments">
+                            <field name="session_count" widget="statinfo" string="Sessions"/>
+                        </button>
+                    </div>
+                    <div class="oe_title">
+                        <label for="name"/>
+                        <h1><field name="name" placeholder="Production Turnstone"/></h1>
+                    </div>
+                    <group>
+                        <group string="Connection">
+                            <field name="base_url" placeholder="https://turnstone.example.com"/>
+                            <field name="api_token" password="True"
+                                   groups="turnstone_integration.group_turnstone_manager"/>
+                            <field name="is_default"/>
+                            <field name="active" invisible="1"/>
+                            <field name="company_id" groups="base.group_multi_company"/>
+                        </group>
+                        <group string="Defaults for new sessions">
+                            <field name="default_skill" placeholder="kube-sre"/>
+                            <field name="default_persona" placeholder="avware-sre"/>
+                            <field name="default_model" placeholder="agentic-coder"/>
+                        </group>
+                    </group>
+                    <group string="Who can use this server">
+                        <field name="allowed_group_ids" widget="many2many_tags" nolabel="1"
+                               colspan="2"
+                               placeholder="Leave empty to allow any Turnstone User"/>
+                    </group>
+                    <div class="alert alert-info" role="status" invisible="not status">
+                        <field name="status" readonly="1" nolabel="1"/>
+                    </div>
+                </sheet>
+            </form>
+        </field>
+    </record>
+
+    <record id="action_turnstone_connection" model="ir.actions.act_window">
+        <field name="name">Turnstone Servers</field>
+        <field name="res_model">turnstone.connection</field>
+        <field name="view_mode">list,form</field>
+        <field name="help" type="html">
+            <p class="o_view_nocontent_smiling_face">Connect Odoo to a Turnstone server</p>
+            <p>
+                Turnstone runs the agents; this module is the interface. You need the
+                server URL and an API token with permission to create workstreams.
+            </p>
+        </field>
+    </record>
+
+</odoo>

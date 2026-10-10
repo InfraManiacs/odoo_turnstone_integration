@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="action_turnstone_schedules" model="ir.actions.client">
+        <field name="name">Scheduled Jobs</field>
+        <field name="tag">turnstone_integration.schedules</field>
+    </record>
+</odoo>

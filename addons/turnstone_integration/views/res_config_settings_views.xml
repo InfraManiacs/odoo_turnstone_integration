@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <record id="res_config_settings_view_form" model="ir.ui.view">
+        <field name="name">res.config.settings.view.form.inherit.turnstone</field>
+        <field name="model">res.config.settings</field>
+        <field name="inherit_id" ref="base.res_config_settings_view_form"/>
+        <field name="arch" type="xml">
+            <xpath expr="//form" position="inside">
+                <app string="Turnstone" name="turnstone_integration"
+                     logo="/turnstone_integration/static/description/icon.png">
+                    <block title="Connection" name="turnstone_connection_block">
+                        <setting string="Default Server"
+                                 help="Used for new chat sessions when the user does not pick one.">
+                            <field name="turnstone_connection_id"/>
+                            <div class="mt-2">
+                                <button name="action_open_turnstone_connections" type="object"
+                                        string="Manage Servers" class="btn-link" icon="fa-arrow-right"/>
+                                <button name="action_test_turnstone" type="object"
+                                        string="Test Connection" class="btn-link" icon="fa-plug"/>
+                            </div>
+                        </setting>
+                    </block>
+                    <block title="Chat" name="turnstone_chat_block">
+                        <setting string="Show Tool Activity"
+                                 help="Show which tools an agent called between its messages. Hiding this makes approvals harder to judge.">
+                            <field name="turnstone_show_tool_calls"/>
+                        </setting>
+                        <setting string="Refresh Interval"
+                                 help="How often the chat asks Turnstone for new output while an agent is working.">
+                            <field name="turnstone_poll_interval"/> ms
+                        </setting>
+                    </block>
+                </app>
+            </xpath>
+        </field>
+    </record>
+
+</odoo>

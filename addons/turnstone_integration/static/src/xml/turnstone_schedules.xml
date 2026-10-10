@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates xml:space="preserve">
+
+<t t-name="turnstone_integration.TurnstoneSchedules">
+    <div class="o_turnstone_schedules p-3 h-100 overflow-auto">
+        <h4>Scheduled Jobs</h4>
+        <p class="text-muted small">
+            Agent jobs Turnstone runs on a cron. Read-only here — create and edit them in
+            the Turnstone console, where the skill, persona and tool policy are all in view.
+        </p>
+
+        <div t-if="state.loading" class="text-muted">Loading…</div>
+
+        <div t-elif="state.error" class="alert alert-danger">
+            <strong>Could not read schedules.</strong>
+            <div t-out="state.error"/>
+        </div>
+
+        <div t-elif="!state.schedules.length" class="alert alert-info">
+            No scheduled jobs on this Turnstone server.
+        </div>
+
+        <table t-else="" class="table table-sm align-middle">
+            <thead>
+                <tr>
+                    <th>Name</th>
+                    <th>Schedule</th>
+                    <th>Skill</th>
+                    <th>Enabled</th>
+                    <th>Last run</th>
+                    <th>Next run</th>
+                    <th/>
+                </tr>
+            </thead>
+            <tbody>
+                <t t-foreach="state.schedules" t-as="s" t-key="s.task_id">
+                    <tr>
+                        <td t-out="s.name"/>
+                        <td class="font-monospace small">
+                            <t t-out="s.cron"/>
+                            <t t-if="s.timezone"> <span class="text-muted" t-out="s.timezone"/></t>
+                        </td>
+                        <td t-out="s.skill or '—'"/>
+                        <td>
+                            <span t-if="s.enabled" class="badge text-bg-success">on</span>
+                            <span t-else="" class="badge text-bg-secondary">off</span>
+                        </td>
+                        <td class="small" t-out="s.last_run or '—'"/>
+                        <td class="small" t-out="s.next_run or '—'"/>
+                        <td>
+                            <button class="btn btn-sm btn-link"
+                                    t-on-click="() => this.toggleRuns(s)">
+                                <t t-out="state.expanded === s.task_id ? 'Hide runs' : 'Runs'"/>
+                            </button>
+                        </td>
+                    </tr>
+                    <tr t-if="state.expanded === s.task_id">
+                        <td colspan="7" class="bg-light">
+                            <div t-if="state.runsLoading" class="text-muted small">Loading runs…</div>
+                            <div t-elif="!state.runs.length" class="text-muted small">
+                                No recorded runs.
+                            </div>
+                            <table t-else="" class="table table-sm mb-0">
+                                <thead>
+                                    <tr><th>Started</th><th>Status</th><th>Workstream</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr t-foreach="state.runs" t-as="r" t-key="r.run_id or r_index">
+                                        <td class="small" t-out="r.started or r.created or '—'"/>
+                                        <td class="small" t-out="r.status or r.state or '—'"/>
+                                        <td class="small font-monospace"
+                                            t-out="r.ws_id or '—'"/>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </td>
+                    </tr>
+                </t>
+            </tbody>
+        </table>
+    </div>
+</t>
+
+</templates>

@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <data noupdate="0">
+
+        <!--
+            Odoo 19 reworked group categorisation: res.groups.category_id is gone,
+            replaced by privilege_id -> res.groups.privilege, which itself points at
+            an ir.module.category. Both records are needed.
+        -->
+        <record id="module_category_turnstone" model="ir.module.category">
+            <field name="name">Turnstone</field>
+            <field name="description">Access to Turnstone agents from Odoo.</field>
+            <field name="sequence">20</field>
+        </record>
+
+        <record id="privilege_turnstone" model="res.groups.privilege">
+            <field name="name">Turnstone</field>
+            <field name="description">Who may chat with Turnstone agents, and who may configure the servers.</field>
+            <field name="category_id" ref="module_category_turnstone"/>
+            <field name="sequence">20</field>
+        </record>
+
+        <record id="group_turnstone_user" model="res.groups">
+            <field name="name">User</field>
+            <field name="privilege_id" ref="privilege_turnstone"/>
+            <field name="comment">
+                Can chat with Turnstone agents and see their own sessions. Cannot
+                configure servers, cannot read API tokens, and cannot see other
+                people's conversations.
+            </field>
+        </record>
+
+        <record id="group_turnstone_manager" model="res.groups">
+            <field name="name">Administrator</field>
+            <field name="privilege_id" ref="privilege_turnstone"/>
+            <field name="implied_ids" eval="[(4, ref('group_turnstone_user'))]"/>
+            <field name="user_ids" eval="[(4, ref('base.user_root')), (4, ref('base.user_admin'))]"/>
+            <field name="comment">
+                Configures Turnstone servers and holds the API tokens. Can see every
+                session, which is a real privilege: a session transcript contains
+                whatever the agent read, and the agent reads with the server token's
+                authority rather than the chatting user's.
+            </field>
+        </record>
+
+        <!--
+            A session is private to its owner. Managers see everything, because
+            they are the people who answer "what did the agent do yesterday".
+        -->
+        <record id="rule_session_own" model="ir.rule">
+            <field name="name">Turnstone: own sessions only</field>
+            <field name="model_id" ref="model_turnstone_session"/>
+            <field name="domain_force">[('user_id', '=', user.id)]</field>
+            <field name="groups" eval="[(4, ref('group_turnstone_user'))]"/>
+            <field name="perm_read" eval="True"/>
+            <field name="perm_write" eval="True"/>
+            <field name="perm_create" eval="True"/>
+            <field name="perm_unlink" eval="True"/>
+        </record>
+
+        <record id="rule_session_manager" model="ir.rule">
+            <field name="name">Turnstone: managers see all sessions</field>
+            <field name="model_id" ref="model_turnstone_session"/>
+            <field name="domain_force">[(1, '=', 1)]</field>
+            <field name="groups" eval="[(4, ref('group_turnstone_manager'))]"/>
+        </record>
+
+        <record id="rule_message_own" model="ir.rule">
+            <field name="name">Turnstone: own messages only</field>
+            <field name="model_id" ref="model_turnstone_message"/>
+            <field name="domain_force">[('session_id.user_id', '=', user.id)]</field>
+            <field name="groups" eval="[(4, ref('group_turnstone_user'))]"/>
+        </record>
+
+        <record id="rule_message_manager" model="ir.rule">
+            <field name="name">Turnstone: managers see all messages</field>
+            <field name="model_id" ref="model_turnstone_message"/>
+            <field name="domain_force">[(1, '=', 1)]</field>
+            <field name="groups" eval="[(4, ref('group_turnstone_manager'))]"/>
+        </record>
+
+        <record id="rule_link_own" model="ir.rule">
+            <field name="name">Turnstone: own linked records only</field>
+            <field name="model_id" ref="model_turnstone_linked_record"/>
+            <field name="domain_force">[('session_id.user_id', '=', user.id)]</field>
+            <field name="groups" eval="[(4, ref('group_turnstone_user'))]"/>
+        </record>
+
+        <record id="rule_link_manager" model="ir.rule">
+            <field name="name">Turnstone: managers see all linked records</field>
+            <field name="model_id" ref="model_turnstone_linked_record"/>
+            <field name="domain_force">[(1, '=', 1)]</field>
+            <field name="groups" eval="[(4, ref('group_turnstone_manager'))]"/>
+        </record>
+
+        <record id="rule_connection_company" model="ir.rule">
+            <field name="name">Turnstone: connections per company</field>
+            <field name="model_id" ref="model_turnstone_connection"/>
+            <field name="domain_force">[('company_id', 'in', company_ids)]</field>
+        </record>
+
+    </data>
+</odoo>

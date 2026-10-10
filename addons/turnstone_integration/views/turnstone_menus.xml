@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <record id="action_turnstone_chat" model="ir.actions.client">
+        <field name="name">Agent Chat</field>
+        <field name="tag">turnstone_integration.chat</field>
+    </record>
+
+    <menuitem id="menu_turnstone_root"
+              name="Turnstone"
+              web_icon="turnstone_integration,static/description/icon.png"
+              sequence="90"
+              groups="turnstone_integration.group_turnstone_user"/>
+
+    <menuitem id="menu_turnstone_chat"
+              name="Agent Chat"
+              parent="menu_turnstone_root"
+              action="action_turnstone_chat"
+              sequence="10"
+              groups="turnstone_integration.group_turnstone_user"/>
+
+    <menuitem id="menu_turnstone_sessions"
+              name="Sessions"
+              parent="menu_turnstone_root"
+              action="action_turnstone_session"
+              sequence="20"
+              groups="turnstone_integration.group_turnstone_user"/>
+
+    <menuitem id="menu_turnstone_config"
+              name="Configuration"
+              parent="menu_turnstone_root"
+              sequence="90"
+              groups="turnstone_integration.group_turnstone_manager"/>
+
+    <menuitem id="menu_turnstone_connections"
+              name="Servers"
+              parent="menu_turnstone_config"
+              action="action_turnstone_connection"
+              sequence="10"
+              groups="turnstone_integration.group_turnstone_manager"/>
+
+    <menuitem id="menu_turnstone_schedules"
+              name="Scheduled Jobs"
+              parent="menu_turnstone_config"
+              action="action_turnstone_schedules"
+              sequence="20"
+              groups="turnstone_integration.group_turnstone_manager"/>
+
+</odoo>

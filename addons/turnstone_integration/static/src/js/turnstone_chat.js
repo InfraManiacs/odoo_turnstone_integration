@@ -1,0 +1,285 @@
+/** @odoo-module **/
+
+import { Component, onWillStart, onWillUnmount, useRef, useState, useEffect } from "@odoo/owl";
+import { registry } from "@web/core/registry";
+import { rpc } from "@web/core/network/rpc";
+import { useService } from "@web/core/utils/hooks";
+import { _t } from "@web/core/l10n/translation";
+
+/**
+ * Turnstone chat client.
+ *
+ * Talks only to this module's Odoo controllers, never to Turnstone directly —
+ * the API token stays server-side (see controllers/main.py).
+ *
+ * State lives in Turnstone, not here. Every action round-trips and replaces the
+ * local session object with whatever the server returned, so a reply that was
+ * rewound or a tool that was denied shows up correctly rather than being merged
+ * into a stale local copy.
+ */
+export class TurnstoneChat extends Component {
+    static template = "turnstone_integration.TurnstoneChat";
+    static props = { action: { type: Object, optional: true }, "*": true };
+
+    setup() {
+        this.notification = useService("notification");
+        this.action = useService("action");
+
+        this.state = useState({
+            loading: true,
+            error: null,
+            connections: [],
+            sessions: [],
+            session: null,
+            draft: "",
+            sending: false,
+            showNewForm: false,
+            catalog: { skills: [], personas: [] },
+            newSession: { connection_id: null, name: "", skill: "", persona: "" },
+            showTools: true,
+        });
+
+        this.threadRef = useRef("thread");
+        this.pollHandle = null;
+        this.pollInterval = 2000;
+
+        onWillStart(async () => {
+            await this.bootstrap();
+            const requested = this.props.action?.params?.session_id;
+            if (requested) {
+                await this.openSession(requested);
+            }
+        });
+
+        onWillUnmount(() => this.stopPolling());
+
+        // Keep the newest turn in view, but only when the transcript actually
+        // grew — otherwise every poll yanks the scroll position back down while
+        // someone is reading earlier output.
+        useEffect(
+            (count) => {
+                if (count !== this._lastCount) {
+                    this._lastCount = count;
+                    this.scrollToBottom();
+                }
+            },
+            () => [this.state.session?.messages?.length ?? 0]
+        );
+    }
+
+    // -- data ----------------------------------------------------------------
+
+    async bootstrap() {
+        const res = await rpc("/turnstone/bootstrap", {});
+        if (res.error) {
+            this.state.error = res.error;
+            this.state.loading = false;
+            return;
+        }
+        this.state.connections = res.connections || [];
+        this.state.sessions = res.sessions || [];
+        this.state.showTools = res.show_tool_calls !== false;
+        this.pollInterval = res.poll_interval || 2000;
+        this.state.newSession.connection_id =
+            (this.state.connections.find((c) => c.is_default) || this.state.connections[0])?.id ??
+            null;
+        this.state.loading = false;
+    }
+
+    async openSession(sessionId) {
+        this.stopPolling();
+        const res = await rpc("/turnstone/session/get", { session_id: sessionId, sync: true });
+        if (res.error) {
+            return this.fail(res.error);
+        }
+        this.state.session = res.session;
+        this.maybePoll();
+    }
+
+    /** Poll only while the agent is actually working. */
+    maybePoll() {
+        this.stopPolling();
+        const s = this.state.session;
+        if (!s || s.state !== "thinking") {
+            return;
+        }
+        this.pollHandle = setTimeout(async () => {
+            if (!this.state.session) {
+                return;
+            }
+            const res = await rpc("/turnstone/session/get", {
+                session_id: this.state.session.id,
+                sync: true,
+            });
+            if (res.error) {
+                return this.fail(res.error);
+            }
+            this.state.session = res.session;
+            await this.refreshSidebar();
+            this.maybePoll();
+        }, this.pollInterval);
+    }
+
+    stopPolling() {
+        if (this.pollHandle) {
+            clearTimeout(this.pollHandle);
+            this.pollHandle = null;
+        }
+    }
+
+    async refreshSidebar() {
+        const res = await rpc("/turnstone/bootstrap", {});
+        if (!res.error) {
+            this.state.sessions = res.sessions || [];
+        }
+    }
+
+    fail(message) {
+        this.state.sending = false;
+        this.stopPolling();
+        this.notification.add(message, { type: "danger", title: _t("Turnstone") });
+    }
+
+    // -- actions -------------------------------------------------------------
+
+    async toggleNewForm() {
+        this.state.showNewForm = !this.state.showNewForm;
+        if (this.state.showNewForm && this.state.newSession.connection_id) {
+            const res = await rpc("/turnstone/catalog", {
+                connection_id: this.state.newSession.connection_id,
+            });
+            if (res.error) {
+                return this.fail(res.error);
+            }
+            this.state.catalog = { skills: res.skills || [], personas: res.personas || [] };
+        }
+    }
+
+    async createSession() {
+        const n = this.state.newSession;
+        const res = await rpc("/turnstone/session/new", {
+            connection_id: n.connection_id,
+            name: n.name || undefined,
+            skill: n.skill || undefined,
+            persona: n.persona || undefined,
+        });
+        if (res.error) {
+            return this.fail(res.error);
+        }
+        this.state.session = res.session;
+        this.state.sessions = res.sessions || this.state.sessions;
+        this.state.showNewForm = false;
+        this.state.newSession.name = "";
+    }
+
+    async send() {
+        const body = this.state.draft.trim();
+        if (!body || this.state.sending || !this.state.session) {
+            return;
+        }
+        this.state.sending = true;
+        this.state.draft = "";
+        const res = await rpc("/turnstone/session/send", {
+            session_id: this.state.session.id,
+            body,
+        });
+        this.state.sending = false;
+        if (res.error) {
+            this.state.draft = body; // give the text back rather than losing it
+            return this.fail(res.error);
+        }
+        this.state.session = res.session;
+        this.state.sessions = res.sessions || this.state.sessions;
+        this.maybePoll();
+    }
+
+    onKeydown(ev) {
+        // Enter sends, Shift+Enter newlines — the convention everywhere else.
+        if (ev.key === "Enter" && !ev.shiftKey) {
+            ev.preventDefault();
+            this.send();
+        }
+    }
+
+    async resolveApproval(approved) {
+        if (!this.state.session) {
+            return;
+        }
+        const res = await rpc("/turnstone/session/approve", {
+            session_id: this.state.session.id,
+            approved,
+        });
+        if (res.error) {
+            return this.fail(res.error);
+        }
+        this.state.session = res.session;
+        this.maybePoll();
+    }
+
+    async cancelGeneration() {
+        const res = await rpc("/turnstone/session/cancel", {
+            session_id: this.state.session.id,
+        });
+        if (res.error) {
+            return this.fail(res.error);
+        }
+        this.state.session = res.session;
+        this.stopPolling();
+    }
+
+    async closeSession() {
+        const res = await rpc("/turnstone/session/close", {
+            session_id: this.state.session.id,
+        });
+        if (res.error) {
+            return this.fail(res.error);
+        }
+        this.state.session = null;
+        this.state.sessions = res.sessions || [];
+        this.stopPolling();
+    }
+
+    /** Jump to an Odoo record the agent created or updated. */
+    openLinkedRecord(link) {
+        this.action.doAction({
+            type: "ir.actions.act_window",
+            res_model: link.res_model,
+            res_id: link.res_id,
+            views: [[false, "form"]],
+            target: "current",
+        });
+    }
+
+    scrollToBottom() {
+        const el = this.threadRef.el;
+        if (el) {
+            // After the patch lands, so the new node has a height.
+            requestAnimationFrame(() => {
+                el.scrollTop = el.scrollHeight;
+            });
+        }
+    }
+
+    // -- presentation --------------------------------------------------------
+
+    stateLabel(state) {
+        return {
+            draft: _t("Not started"),
+            idle: _t("Ready"),
+            thinking: _t("Working…"),
+            attention: _t("Waiting for you"),
+            error: _t("Error"),
+            closed: _t("Closed"),
+        }[state] || state;
+    }
+
+    operationLabel(op) {
+        return { create: _t("Created"), write: _t("Updated"), message: _t("Posted to") }[op] || op;
+    }
+
+    get contextPercent() {
+        return Math.round((this.state.session?.context_ratio || 0) * 100);
+    }
+}
+
+registry.category("actions").add("turnstone_integration.chat", TurnstoneChat);

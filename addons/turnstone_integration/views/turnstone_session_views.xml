@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <record id="view_turnstone_session_list" model="ir.ui.view">
+        <field name="name">turnstone.session.list</field>
+        <field name="model">turnstone.session</field>
+        <field name="arch" type="xml">
+            <list string="Sessions" decoration-warning="state == 'attention'"
+                  decoration-muted="state == 'closed'" decoration-danger="state == 'error'">
+                <field name="name"/>
+                <field name="user_id" widget="many2one_avatar_user"/>
+                <field name="connection_id"/>
+                <field name="skill"/>
+                <field name="state" widget="badge"/>
+                <field name="linked_record_count" string="Odoo records"/>
+                <field name="last_activity"/>
+                <button name="action_open_chat" type="object" string="Open" icon="fa-comments"/>
+            </list>
+        </field>
+    </record>
+
+    <record id="view_turnstone_session_form" model="ir.ui.view">
+        <field name="name">turnstone.session.form</field>
+        <field name="model">turnstone.session</field>
+        <field name="arch" type="xml">
+            <form string="Session">
+                <header>
+                    <button name="action_open_chat" type="object" string="Open Chat"
+                            class="btn-primary"/>
+                    <button name="sync_from_server" type="object" string="Refresh"
+                            invisible="not ws_id"/>
+                    <button name="action_close" type="object" string="Close Session"
+                            invisible="state == 'closed'"/>
+                    <field name="state" widget="statusbar"
+                           statusbar_visible="draft,idle,thinking,attention"/>
+                </header>
+                <sheet>
+                    <div class="oe_title">
+                        <h1><field name="name" readonly="1"/></h1>
+                    </div>
+                    <group>
+                        <group string="Session">
+                            <field name="user_id"/>
+                            <field name="connection_id"/>
+                            <field name="ws_id"/>
+                            <field name="node_id"/>
+                        </group>
+                        <group string="Agent">
+                            <field name="skill"/>
+                            <field name="persona"/>
+                            <field name="model_alias"/>
+                            <field name="tool_call_count"/>
+                            <field name="token_count"/>
+                            <field name="last_activity"/>
+                        </group>
+                    </group>
+                    <notebook>
+                        <page string="Transcript" name="transcript">
+                            <field name="message_ids" readonly="1">
+                                <list>
+                                    <field name="sequence" string="#"/>
+                                    <field name="role"/>
+                                    <field name="tool_names" string="Tools"/>
+                                    <field name="body"/>
+                                </list>
+                            </field>
+                        </page>
+                        <page string="Odoo Records Touched" name="linked">
+                            <field name="linked_record_ids" readonly="1">
+                                <list>
+                                    <field name="operation"/>
+                                    <field name="res_model" string="Model"/>
+                                    <field name="res_id" string="ID"/>
+                                    <field name="display_name_cache" string="Name"/>
+                                    <field name="record_exists" string="Exists"/>
+                                    <button name="action_open_record" type="object"
+                                            string="Open" icon="fa-external-link"/>
+                                </list>
+                            </field>
+                        </page>
+                    </notebook>
+                </sheet>
+            </form>
+        </field>
+    </record>
+
+    <record id="view_turnstone_session_search" model="ir.ui.view">
+        <field name="name">turnstone.session.search</field>
+        <field name="model">turnstone.session</field>
+        <field name="arch" type="xml">
+            <search>
+                <field name="name"/>
+                <field name="skill"/>
+                <field name="user_id"/>
+                <filter name="mine" string="My Sessions"
+                        domain="[('user_id', '=', uid)]"/>
+                <filter name="needs_me" string="Waiting for Approval"
+                        domain="[('state', '=', 'attention')]"/>
+                <filter name="open" string="Open"
+                        domain="[('state', '!=', 'closed')]"/>
+                <separator/>
+                <!-- linked_record_count is a non-stored compute and so unsearchable;
+                     the one2many it counts is searchable. -->
+                <filter name="touched_odoo" string="Touched Odoo Records"
+                        domain="[('linked_record_ids', '!=', False)]"/>
+                <group name="group_by">
+                    <filter name="by_user" string="Owner" context="{'group_by': 'user_id'}"/>
+                    <filter name="by_skill" string="Skill" context="{'group_by': 'skill'}"/>
+                    <filter name="by_state" string="Status" context="{'group_by': 'state'}"/>
+                </group>
+            </search>
+        </field>
+    </record>
+
+    <record id="action_turnstone_session" model="ir.actions.act_window">
+        <field name="name">Sessions</field>
+        <field name="res_model">turnstone.session</field>
+        <field name="view_mode">list,form</field>
+        <field name="context">{'search_default_open': 1}</field>
+        <field name="help" type="html">
+            <p class="o_view_nocontent_smiling_face">No sessions yet</p>
+            <p>Start one from Agent Chat.</p>
+        </field>
+    </record>
+
+</odoo>
