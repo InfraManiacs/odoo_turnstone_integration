@@ -16,6 +16,8 @@ import re
 from odoo import _, api, fields, models
 from odoo.exceptions import AccessError, UserError
 
+from .turnstone_client import TurnstoneError, TurnstoneNotFound
+
 _logger = logging.getLogger(__name__)
 
 # Odoo MCP tools that mean "something changed in Odoo". Mapped to the operation
@@ -117,6 +119,18 @@ class TurnstoneSession(models.Model):
     pending_approval_json = fields.Text(readonly=True)
     has_pending_approval = fields.Boolean(
         compute="_compute_has_pending_approval", store=True,
+    )
+
+    remote_gone = fields.Boolean(
+        readonly=True,
+        help="Turnstone no longer has this workstream (HTTP 404 on the last sync). "
+             "The transcript was cleared then; this flag is why it is empty.",
+    )
+    sync_note = fields.Text(
+        readonly=True,
+        help="Why the last sync did not apply a remote response it did not trust — "
+             "for example a node that answered before it had loaded the history, or "
+             "a bounded message tail. Empty when the mirror is following the server.",
     )
 
     @api.depends("pending_approval_json")
@@ -268,7 +282,10 @@ class TurnstoneSession(models.Model):
         self.env["turnstone.audit.log"].log(
             "session_rewind", session=self, detail=_("%s turn(s)") % turns,
         )
-        return self.sync_from_server()
+        # Authoritative: dropping turns is this call's whole purpose, so a
+        # shorter transcript here is the truth rather than a partial response.
+        # Without it a rewind back to nothing would be refused as "no history".
+        return self.sync_from_server(authoritative=True)
 
     def action_cancel_queued(self):
         """Drop a message queued behind the in-flight turn, leaving the turn alone."""
@@ -301,32 +318,216 @@ class TurnstoneSession(models.Model):
 
     # -- sync --------------------------------------------------------------
 
-    def sync_from_server(self):
-        """Pull the authoritative state and transcript from Turnstone."""
+    def sync_from_server(self, authoritative=False):
+        """Pull the authoritative state and transcript from Turnstone.
+
+        Three outcomes, and the difference between them is the whole point of
+        this method:
+
+        1. **A usable response** — state, counters and transcript are applied
+           together, inside one savepoint, so a failure part-way leaves the
+           previous transcript (and the header that goes with it) intact
+           rather than half replaced.
+        2. **A transport failure** — an exception is raised **before anything
+           is written**, so the caller gets an error to show and the mirror is
+           exactly as it was. This covers HTTP 401/403/5xx and a non-JSON
+           body, and — the case that used to be silent — HTTP 200 carrying
+           ``{"error": …}``, which is what a console answers for a session it
+           cannot serve. None of those is evidence about the conversation.
+        3. **A 404** — the workstream is gone from Turnstone. Only here may the
+           transcript be cleared, and the clearing is recorded (``remote_gone``
+           plus an audit entry) so an empty transcript has a reason attached
+           instead of looking like data loss. ``authoritative=True`` clears it
+           too, for a caller that knows the remote is gone.
+
+        ``authoritative`` is for a caller that just changed the remote
+        transcript itself (a rewind), so a short or empty list is the truth
+        rather than a partial view. See
+        ``turnstone.message._replace_transcript``.
+        """
         self.ensure_one()
         self._check_owner()
         if not self.ws_id:
             return self._as_dict()
 
-        detail = self.connection_id._client().session_detail(self.ws_id)
-        live = detail.get("live") or {}
-        persisted = detail.get("persisted") or {}
-        messages = detail.get("messages") or []
+        detail = self._fetch_detail()
+        if detail is None:
+            # 404: recorded by _fetch_detail as the clear. Nothing else to apply.
+            return self._as_dict()
 
-        pending = live.get("pending_approval_details") or []
-        raw_state = live.get("state") or persisted.get("state") or "idle"
-        state = "attention" if pending else self._map_state(raw_state)
+        vals = self._detail_vals(detail)
+        messages = detail.get("messages")
+        if not isinstance(messages, list):
+            # The key is absent or not a list. That is no evidence about the
+            # transcript, so the mirror is left alone rather than emptied.
+            vals["sync_note"] = _(
+                "Turnstone's response carried no message list, so the stored "
+                "transcript was left as it was.",
+            )
+            messages = None
 
+        # The transcript and the header it describes go in as ONE unit: a
+        # response that is refused must not have already rewritten the state,
+        # counters and last-activity of a session it did not describe. The
+        # savepoint makes that true even if the write itself fails part-way.
+        with self.env.cr.savepoint():
+            if messages is not None:
+                vals["sync_note"] = self.env["turnstone.message"]._replace_transcript(
+                    self, messages, authoritative=authoritative,
+                ) or False
+            self.sudo().write(vals)
+
+        self._sync_linked_records(messages or [])
+        self._sync_subagents()
+        return self._as_dict()
+
+    # -- sync internals ----------------------------------------------------
+
+    def _fetch_detail(self):
+        """The session detail, or None when Turnstone says it is gone.
+
+        A 404 is the one remote answer that may destroy local state, because it
+        is the one that is a statement about this session: it does not exist.
+        Everything else either raises (and nothing is written) or is applied.
+
+        A body that CARRIES an error is an error even at HTTP 200: the console
+        answers a workstream it cannot serve with ``{"error": …}`` and a 200
+        status, and that body has no ``live``/``persisted``/``messages`` — read
+        as data it looks exactly like an empty conversation, which is how a
+        working session's transcript was wiped (OTI-5729 shape 3).
+        ``approve()``'s deliberate ``{"already_resolved": True}`` has no
+        ``error`` key, so it is not affected.
+
+        A session this side already considers closed is treated differently on
+        404: its remote workstream being gone is expected rather than news, and
+        the local transcript is the only copy left. That is the case where
+        deleting rows would throw away the thing the user came to read.
+        """
+        self.ensure_one()
+        try:
+            detail = self.connection_id._client().session_detail(self.ws_id)
+        except TurnstoneNotFound:
+            # Record it once. A session that is gone keeps being polled (the
+            # chat refreshes on a timer), and one audit row per poll would bury
+            # the log that exists to say this happened.
+            if not self.remote_gone:
+                self._record_remote_gone(keep_transcript=self.state == "closed")
+            return None
+        if isinstance(detail, dict) and detail.get("error"):
+            raise TurnstoneError(
+                _("Turnstone refused the session's detail: %s") % detail["error"]
+            )
+        if not isinstance(detail, dict):
+            raise TurnstoneError(
+                _("Turnstone returned an unexpected session detail (a %s, not an object).")
+                % type(detail).__name__
+            )
+        if not ({"live", "persisted", "messages"} & set(detail)):
+            # Parsed, 200, and says nothing about the session. Applying it would
+            # be inventing a state for a session this response never described.
+            raise TurnstoneError(
+                _("Turnstone's session detail carried none of the expected blocks "
+                  "(live, persisted, messages), so nothing was applied.")
+            )
+        return detail
+
+    def _record_remote_gone(self, keep_transcript=False):
+        """Record that Turnstone no longer has the workstream, and usually clear.
+
+        What is cleared is the VOLATILE half — transcript, live state, counters,
+        pending approval — because none of it can be refreshed any more and a
+        half-kept header would be a claim about a session that no longer exists.
+        Subagent rows and linked records stay: they are history (what ran, what
+        it touched), not a claim that anything is still live. The Odoo row
+        itself stays too, with the reason attached.
+
+        ``keep_transcript`` is for a session already closed this side: its
+        remote workstream being gone is expected, not news, and the local
+        transcript is then the only copy there is. The outcome is still
+        recorded, so "why is this greyed out and unsyncable" has an answer.
+        """
+        self.ensure_one()
+        note = _(
+            "Turnstone no longer has this session's workstream (%s): it was "
+            "deleted or expired on the server, so the transcript cannot be "
+            "read any more.",
+        ) % (self.ws_id or "")
         vals = {
-            "state": state,
-            "pending_approval_json": json.dumps(pending),
-            "tool_call_count": live.get("tool_calls") or 0,
-            "token_count": live.get("tokens") or 0,
-            "context_ratio": live.get("context_ratio") or 0.0,
-            "activity": live.get("activity") or False,
-            "activity_state": live.get("activity_state") or False,
+            "remote_gone": True,
+            "sync_note": note,
+            "activity": False,
+            "activity_state": False,
+            "pending_approval_json": "[]",
+            "tool_call_count": 0,
+            "token_count": 0,
+            "context_ratio": 0.0,
             "last_activity": fields.Datetime.now(),
         }
+        if not keep_transcript:
+            vals["state"] = "error"
+        with self.env.cr.savepoint():
+            if not keep_transcript:
+                self.sudo().message_ids.unlink()
+            self.sudo().write(vals)
+        self.env["turnstone.audit.log"].log(
+            "sync_remote_gone", session=self,
+            detail=_("Turnstone answered 404 for workstream %(ws)s; %(what)s")
+                   % {"ws": self.ws_id or "",
+                      "what": ("closed session's transcript kept" if keep_transcript
+                               else "local transcript cleared")},
+        )
+        _logger.info(
+            "Turnstone no longer has workstream %s (session %s); kept transcript: %s",
+            self.ws_id, self.id, keep_transcript,
+        )
+
+    def _detail_vals(self, detail):
+        """The header fields one detail response actually carries.
+
+        Only keys the response contains are written. A payload that omits
+        ``live`` is not a claim that the agent has no pending approvals and is
+        using no tokens — it says nothing at all — and treating absence as zero
+        rewrites the header of a session that is working. The one exception is
+        ``state``: it falls back to ``idle`` because a session with a
+        workstream and no reported state is, as far as anything can tell, not
+        working.
+        """
+        self.ensure_one()
+        live = detail.get("live")
+        live = live if isinstance(live, dict) else {}
+        persisted = detail.get("persisted")
+        persisted = persisted if isinstance(persisted, dict) else {}
+
+        vals = {}
+        if live or persisted.get("state"):
+            raw_state = live.get("state") or persisted.get("state") or "idle"
+            # Approvals are only cleared or replaced by a live block that
+            # actually carries the key. A response with no live block says
+            # nothing about them, and blanking them would hide a tool call that
+            # is still waiting on a human.
+            if "pending_approval_details" in live:
+                pending = live["pending_approval_details"] or []
+                vals["pending_approval_json"] = json.dumps(pending)
+            else:
+                try:
+                    pending = json.loads(self.pending_approval_json or "[]")
+                except ValueError:
+                    pending = []
+            vals["state"] = "attention" if pending else self._map_state(raw_state)
+        for key, field in (
+            ("tool_calls", "tool_call_count"),
+            ("tokens", "token_count"),
+            ("context_ratio", "context_ratio"),
+        ):
+            if key in live and live[key] is not None:
+                vals[field] = live[key]
+        if "activity" in live:
+            vals["activity"] = live["activity"] or False
+        if "activity_state" in live:
+            vals["activity_state"] = live["activity_state"] or False
+        if live or persisted:
+            vals["last_activity"] = fields.Datetime.now()
+
         if persisted.get("kind"):
             vals["kind"] = persisted["kind"]
         if persisted.get("parent_ws_id"):
@@ -340,12 +541,10 @@ class TurnstoneSession(models.Model):
             vals["name"] = title
         if persisted.get("node_id"):
             vals["node_id"] = persisted["node_id"]
-
-        self.sudo().write(vals)
-        self._sync_messages(messages)
-        self._sync_linked_records(messages)
-        self._sync_subagents()
-        return self._as_dict()
+        # A response that parsed is evidence the session is back, whatever
+        # made it look gone before.
+        vals["remote_gone"] = False
+        return vals
 
     def _sync_subagents(self):
         """Upsert the children currently visible, and mark the rest finished."""
@@ -389,58 +588,24 @@ class TurnstoneSession(models.Model):
             return "closed"
         return "thinking"
 
-    def _sync_messages(self, messages):
-        """Replace the mirrored transcript.
+    def _sync_messages(self, messages, authoritative=False):
+        """Replace the mirrored transcript. Thin alias for the message model.
 
-        Rewritten wholesale rather than appended because Turnstone can rewind or
-        retry a turn, which removes messages. Diffing an append-only log against
-        a mutable one is how you end up showing a reply that was taken back.
+        Kept because it is what the rest of this module (and the README) calls
+        it; the comparison and the guards live in
+        ``turnstone.message._replace_transcript``, next to the rows they
+        touch.
+
+        Rewritten wholesale rather than appended because Turnstone can rewind
+        or retry a turn, which removes messages. Diffing an append-only log
+        against a mutable one is how you end up showing a reply that was taken
+        back. What that rule must NOT mean is "replace with any response that
+        arrives" — see the guards in ``_replace_transcript``.
         """
         self.ensure_one()
-        rows = []
-        for idx, msg in enumerate(messages):
-            role = msg.get("role")
-            if role not in ("user", "assistant", "tool", "system"):
-                continue
-            body = msg.get("content")
-            if isinstance(body, list):
-                body = " ".join(str(p.get("text") or "") for p in body)
-            body = (body or "").strip()
-            tool_names = ", ".join(
-                t.get("function", {}).get("name") or t.get("name") or ""
-                for t in (msg.get("tool_calls") or [])
-            ).strip(", ")
-
-            is_guard = role == "system" and body.startswith("Output guard:")
-            # Tool results are enormous and already summarised by the agent's
-            # next turn. Keep a stub so the transcript shows work happened.
-            if role == "tool":
-                body = (body[:280] + "…") if len(body) > 280 else body
-            # A system turn that is neither a guard notice nor useful prose is
-            # Turnstone plumbing (memory pointers and the like).
-            if role == "system" and not is_guard:
-                continue
-            if not body and not tool_names:
-                continue
-
-            rows.append({
-                "session_id": self.id,
-                "sequence": idx,
-                "role": role,
-                "body": body,
-                "tool_names": tool_names or False,
-                "is_guard_notice": is_guard,
-            })
-
-        existing = self.sudo().message_ids
-        if len(existing) == len(rows) and all(
-            e.sequence == r["sequence"] and e.body == (r["body"] or False)
-            for e, r in zip(existing, rows)
-        ):
-            return  # unchanged; avoid the churn
-        existing.unlink()
-        if rows:
-            self.env["turnstone.message"].sudo().create(rows)
+        return self.env["turnstone.message"]._replace_transcript(
+            self, messages, authoritative=authoritative,
+        )
 
     def _sync_linked_records(self, messages):
         """Build links from the agent's Odoo MCP writes.
@@ -794,6 +959,12 @@ class TurnstoneSession(models.Model):
             "adopted": rec.adopted,
             "agent_id": rec.agent_id.id or None,
             "agent_name": rec.agent_id.name or None,
+            # Why the transcript is empty, when it is empty for a reason the
+            # user can act on: the workstream was deleted on the server, or a
+            # sync was refused as partial. Without these an empty transcript
+            # reads as data loss.
+            "remote_gone": rec.remote_gone,
+            "sync_note": rec.sync_note or "",
             "supports_attachments": rec.supports_attachments,
             "activity": rec.activity or "",
             "activity_state": rec.activity_state or "",

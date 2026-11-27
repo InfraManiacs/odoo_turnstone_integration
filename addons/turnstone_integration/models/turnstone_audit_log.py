@@ -34,6 +34,7 @@ class TurnstoneAuditLog(models.Model):
             ("session_retry", "Retried a turn"),
             ("session_rewind", "Rewound a turn"),
             ("session_close", "Closed a session"),
+            ("sync_remote_gone", "Session deleted on the server"),
             ("attachment_add", "Attached a file"),
             ("attachment_remove", "Removed an attachment"),
             ("connection_test", "Tested a connection"),
