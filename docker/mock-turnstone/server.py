@@ -8,9 +8,14 @@ in memory (`state.py`), and performs **no agent work at all**: no model call, no
 tool execution, no timing simulation. A canned reply is a string read from the
 environment (OTI-5738); that is the whole of it.
 
-Run it with no arguments and no `.env`:
+python3 docker/mock-turnstone/server.py            # starts on 0.0.0.0:8099, token "mock-token"
+python3 docker/mock-turnstone/server.py --help     # this text; --version prints the mock's version
 
-    python docker/mock-turnstone/server.py
+There are no other flags: everything that shapes behaviour is an environment
+variable, because a compose service and a container healthcheck can only pass
+env. An unrecognised argument exits 2 with a message instead of being ignored —
+a harness that silently starts a server when asked a question is a harness that
+wastes an hour.
 
 Configuration, all read from the environment at startup:
 
@@ -918,7 +923,23 @@ def make_server(config=None):
 
 
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    # Flags are deliberately minimal: everything that shapes behaviour is an env
+    # var, because the compose service and the container healthcheck can only
+    # pass env. These two exist so that a person who types `--help` is not left
+    # with a running server and no explanation — argv used to be ignored.
+    if "-h" in argv or "--help" in argv:
+        print(__doc__)
+        return 0
+    unknown = [a for a in argv if a not in ("--version",)]
+    if unknown:
+        print("mock-turnstone: unknown argument(s): %s\n" % " ".join(unknown), file=sys.stderr)
+        print("configure it with environment variables; try --help", file=sys.stderr)
+        return 2
     config = Config.from_env()
+    if "--version" in argv:
+        print(MOCK_VERSION)
+        return 0
     logging.basicConfig(
         level=getattr(logging, config.log_level, logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",

@@ -32,6 +32,12 @@ curl -H 'Authorization: Bearer mock-token' http://localhost:8099/health
 `python3` and `python` both work; it is written for Python 3.9+ (no match
 statements, no third-party imports).
 
+`--help` prints the module docstring and `--version` prints the mock's version.
+There are no other flags — everything that shapes behaviour is an environment
+variable, because a compose service and a container healthcheck can only pass
+env. An unrecognised argument exits 2 with a message rather than being silently
+ignored, so a typo does not leave you with a server running the wrong shape.
+
 ### In-process, for a test that can import it
 
 `server.py` is importable, and `make_server()` returns a bound-but-not-serving
