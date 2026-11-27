@@ -1,0 +1,96 @@
+# Throwaway stack for running the addon's Odoo tests against the mock
+# Turnstone server. Driven by scripts/test-odoo.sh — read that first; this file
+# is deliberately unusable by hand (see the required variables below).
+#
+# It is a *separate* compose file, not a profile in docker-compose.yml, so that
+# a test run can never resolve to the developer stack's project, container
+# names or volumes. Two variables make that explicit and are required, not
+# defaulted:
+#
+#   OTI_TEST_PROJECT   compose project name (also the volume prefix)
+#   OTI_TEST_TOKEN     bearer token the mock requires and Odoo sends
+#
+# `docker compose -f docker-compose.test.yml up` with those unset refuses to
+# run, which is the point: there is no "forgot the file" mode that starts a
+# test database in the development project.
+name: ${OTI_TEST_PROJECT:?scripts/test-odoo.sh sets OTI_TEST_PROJECT; do not run this file directly}
+
+services:
+  db:
+    image: postgres:16
+    # No published port: nothing outside the compose network needs the test
+    # database, and a published port is how two runs collide.
+    environment:
+      POSTGRES_USER: odoo
+      POSTGRES_PASSWORD: odoo
+      POSTGRES_DB: postgres
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      # `name:` pins the volume to the run id rather than letting compose
+      # derive it, so `down -v` and the post-run leftovers check both work off
+      # one name the script can predict.
+      - db-data:/var/lib/postgresql/data/pgdata
+    healthcheck:
+      # Odoo's entrypoint waits for Postgres anyway, but `up --wait` needs the
+      # healthcheck to know the database is actually accepting connections
+      # before the test container starts.
+      test: ["CMD-SHELL", "pg_isready -U odoo -d postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  mock-turnstone:
+    image: python:3.12-slim
+    # The mock is stdlib-only, so there is no image to build and no
+    # requirements to install: mount the source and run it.
+    # MOCK_TURNSTONE_HEALTH_PUBLIC=1 lets the healthcheck below run without a
+    # token. Only /health is unauthenticated; every real endpoint still checks.
+    environment:
+      MOCK_TURNSTONE_HOST: 0.0.0.0
+      MOCK_TURNSTONE_PORT: "8099"
+      MOCK_TURNSTONE_TOKEN: ${OTI_TEST_TOKEN:?scripts/test-odoo.sh sets OTI_TEST_TOKEN}
+      MOCK_TURNSTONE_HEALTH_PUBLIC: "1"
+      MOCK_TURNSTONE_LOG_LEVEL: ${OTI_TEST_MOCK_LOG_LEVEL:-WARNING}
+    volumes:
+      - ./docker/mock-turnstone:/app:ro
+    working_dir: /app
+    command: ["python", "server.py"]
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8099/health', timeout=3)"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  odoo:
+    image: ${OTI_TEST_ODOO_IMAGE:-odoo:19.0-20260926}
+    depends_on:
+      db:
+        condition: service_healthy
+      mock-turnstone:
+        condition: service_healthy
+    environment:
+      # New in 19.0: PGHOST/PGPORT/PGUSER/PGPASSWORD are Odoo's own option
+      # env vars (see odoo/tools/config.py), so these reach the process
+      # without a -c file and without the entrypoint's wait-for-psql guess.
+      PGHOST: db
+      PGPORT: "5432"
+      PGUSER: odoo
+      PGPASSWORD: odoo
+    volumes:
+      # Read-only: a test run must not be able to leave __pycache__ in the
+      # working tree, and it is the only mount the tests actually need.
+      - ./addons:/mnt/extra-addons:ro
+      #
+      # No /var/lib/odoo volume. Odoo writes a filestore there, and a test
+      # database that is discarded should take its filestore with it — the
+      # container is removed by `run --rm`, so nothing survives.
+    # The test run itself is `docker compose run --rm odoo …` (see the script),
+    # which is what makes Odoo's exit code the exit code of the run. A plain
+    # `up` here would start a server with no tests and no useful exit code, so
+    # the command is a refusal rather than an idle server.
+    command: ["sh", "-c", "echo 'use scripts/test-odoo.sh: this service is started with compose run, not up' >&2; exit 64"]
+
+volumes:
+  db-data:
+    name: ${OTI_TEST_PROJECT:?scripts/test-odoo.sh sets OTI_TEST_PROJECT}-db-data
