@@ -110,8 +110,8 @@ exactly as the handler wrote them: a top-level JSON list stays a list, because
 
 ## Implemented paths
 
-Route table as of this ticket: **11 of 37 declared paths do something, the rest
-answer 501 naming their owner** (16 unclaimed, 12 owned by a later ticket in
+Route table as of this ticket: **15 of 37 declared paths do something, the rest
+answer 501 naming their owner** (16 unclaimed, 6 owned by OTI-5736/5738 in
 this story). The live table is always available from the running process:
 
 ```sh
@@ -128,6 +128,10 @@ curl -H 'Authorization: Bearer mock-token' http://localhost:8099/v1/api/admin/mo
 | GET | `/v1/api/admin/personas` | bare JSON list |
 | GET | `/v1/api/models` | `{"models": [...]}`. Inert in the addon today (aliases come from the cluster feed) but the client has the method, so the mock answers it |
 | GET | `/v1/api/cluster/overview` | `workstreams`, `nodes`, `states.{idle,thinking,attention,error,closed}`, `aggregate.{tokens,tool_calls,total_tool_calls,total_tokens}` — the keys `turnstone_live.xml` renders |
+| POST | `/v1/api/workstreams/new` | **console create, coordinators only.** `name`, `skill`, `persona`, `initial_message`. Returns `ws_id`, `node_id`, `kind`, the rest of the row, and the whole record under `workstream`. There is no `kind` field on this endpoint: send one and you get a coordinator anyway (it is recorded under `meta.kind` so the mistake is visible) |
+| POST | `/v1/api/route/workstreams/new` | **proxy create, interactive only.** Accepts `kind` (default `interactive`), `model`, `judge_model`, `client_type` and the auto-approve fields. Refuses `kind: "coordinator"` with a 400 naming the console path. Same response shape as the console |
+| GET | `/v1/api/cluster/workstreams` | The cluster feed: `workstreams[]`, `total`, `page`, `per_page`. Query: `page`, `per_page`, `state` (exact), `search` (id/name/title, case-insensitive). Rows carry `id` **and** `ws_id`, `parent_ws_id`, `model_alias` **and** `model`, `node` **and** `node_id`, counters — and **no** transcript |
+| GET | `/v1/api/cluster/ws/{ws_id}/detail` | One session of either kind: `persisted` (row: `ws_id`, kind, parent, persona, node, state, title, model), `live` (state, tokens, tool_calls, context_ratio, activity, activity_state, `pending_approval_details`) and `messages` — always present, `[]` when empty |
 | POST | `/v1/api/admin/mock/reset` | **mock only.** Back to the post-startup shape: no workstreams, ids restart at `ws-000001`, catalogue re-seeded, request log cleared |
 | GET | `/v1/api/admin/mock/state` | **mock only.** Full state snapshot for assertions |
 | POST | `/v1/api/admin/mock/seed` | **mock only.** Create a workstream directly, with any state, transcript, counters and a pinned `ws_id` |
@@ -141,10 +145,6 @@ reshaping URLs. The `owner` in the 501 body is the ticket.
 
 | Method | Path | Owner |
 |---|---|---|
-| POST | `/v1/api/workstreams/new` | OTI-5734 — console creation, coordinators only (takes no `kind`, no `model`) |
-| POST | `/v1/api/route/workstreams/new` | OTI-5734 — routing proxy creation, the only surface accepting `kind` |
-| GET | `/v1/api/cluster/workstreams` | OTI-5734 — the cluster feed (children, Live Activity) |
-| GET | `/v1/api/cluster/ws/{ws_id}/detail` | OTI-5734 — persisted + live + messages for any node |
 | GET | `/v1/api/workstreams/{ws_id}/history` | OTI-5736 — console history |
 | GET | `/v1/api/route/workstreams/{ws_id}/history` | OTI-5736 — declared for symmetry; the client reads history via cluster detail |
 | POST | `/v1/api/workstreams/{ws_id}/rewind` and its `/route/` twin | OTI-5736 — needed to prove the mirror follows a server-side rewind |
@@ -161,6 +161,74 @@ reshaping URLs. The `owner` in the 501 body is the ticket.
 
 "Unclaimed" means no ticket in story OTI-698 declares it yet. If a test needs
 one, say so on the harness ticket rather than adding a silent path here.
+
+## Creating workstreams, and the split at creation time
+
+Two endpoints, two surfaces, two handlers — the same split as above, decided
+once per surface rather than again per request:
+
+| Endpoint | Makes | Takes |
+|---|---|---|
+| `POST /v1/api/workstreams/new` (console) | a **coordinator**, always | `name`, `skill`, `persona`, `initial_message` — no `kind`, no `model` |
+| `POST /v1/api/route/workstreams/new` (proxy) | an **interactive** session | `kind` (default `interactive`), `model`, `judge_model`, `client_type`, `auto_approve`, `auto_approve_tools`, `name`, `skill`, `persona`, `initial_message` |
+
+```sh
+T='Authorization: Bearer mock-token'; B=http://localhost:8099
+
+# A coordinator. Note there is no kind field to get wrong.
+curl -X POST -H "$T" $B/v1/api/workstreams/new \
+  -d '{"name":"Coord","skill":"mock-coordinator","initial_message":"plan the work"}'
+# {"ws_id":"ws-000001","node_id":"node-mock-1","kind":"coordinator",...}
+
+# An interactive session, which is the only kind the proxy can make.
+curl -X POST -H "$T" $B/v1/api/route/workstreams/new \
+  -d '{"kind":"interactive","name":"Session","model":"mock-model","client_type":"web"}'
+
+# Asking the proxy for a coordinator is a 400 that names the right endpoint.
+curl -X POST -H "$T" $B/v1/api/route/workstreams/new -d '{"kind":"coordinator"}'
+# {"error":"kind 'coordinator' cannot be created through the routing proxy",
+#  "detail":"coordinator workstreams must be created on the console via POST /v1/api/workstreams/new"}
+```
+
+Both answer **201** with `ws_id` and `node_id` at the top level, because that is
+literally what `turnstone_session._ensure_started` writes onto the Odoo row — a
+create response without `ws_id` is failure mode 1 in the persistence
+investigation (the user's message silently goes nowhere), so the mock never
+produces one. Everything the endpoint cannot act on (`client_type`,
+`judge_model`, the auto-approve lists) is kept on the record under `meta`, so
+"what did Odoo ask for" is answerable without pretending the mock honours it.
+
+`initial_message` becomes the first **user** turn of the stored transcript, and
+the state stays `idle`: this server runs no model, so it will not claim to be
+`thinking` about a reply that is never coming. The assistant side is OTI-5738's
+canned reply.
+
+## Listing and detail
+
+```sh
+curl -H "$T" "$B/v1/api/cluster/workstreams?per_page=50&page=1"
+curl -H "$T" "$B/v1/api/cluster/workstreams?state=attention"
+curl -H "$T" "$B/v1/api/cluster/workstreams?search=coord"
+curl -H "$T" $B/v1/api/cluster/ws/ws-000001/detail
+```
+
+`per_page` and `page` are applied **after** `state` and `search`, so `total` is
+how many workstreams match rather than how many the page holds. Order is
+creation order, oldest first, which is the order ids are handed out in — an
+assertion can name a position instead of sorting. A page past the end is an
+empty list with a correct `total`, not a 404.
+
+Feed rows are summaries: `id` and `ws_id` both carry the id, `model_alias` and
+`model` both carry the alias, `node` and `node_id` both carry the node, because
+the addon reads one spelling in `turnstone_session._children` and the other in
+`controllers/main.py`. `messages` is deliberately absent from a row — 200 rows
+of transcript would be enormous, and detail is where the transcript lives.
+
+Detail is the one endpoint that answers for **either** kind (it is how the addon
+reads an interactive session, whose history lives on its node and not on the
+console). `messages` is present and `[]` when there are no turns: a missing key
+is what makes the Odoo client treat a healthy session as an empty conversation
+and wipe its mirror, so the mock never omits it.
 
 ## The console/route split, and why it matters here
 
@@ -252,9 +320,13 @@ Bodies are truncated at 2000 characters. The bearer token is never recorded.
 This ticket (OTI-5733) is the core: bind/auth/404/route table. Then:
 
 * **OTI-5734** — workstream creation on both surfaces, the cluster feed, and
-  `cluster/ws/{id}/detail` with state/kind/model/counters.
+  `cluster/ws/{id}/detail` with state/kind/model/counters. **Done**: see
+  "Creating workstreams" and "Listing and detail" above. The detail endpoint
+  returns `messages` from whatever a create's `initial_message` or a seed
+  planted; the message *shapes* are OTI-5736's.
 * **OTI-5736** — transcripts: `detail` carries `messages`, a history endpoint
   mirrors it, and `state.py` gains the seed helper for pre-planted transcripts.
+  (The seed helper already exists from OTI-5733; 5736 owns the shapes.)
 * **OTI-5738** — prompt post appends the user turn plus one canned assistant
   turn and moves the token counters.
 * **OTI-5740** — switchable failure modes (500, slow, malformed JSON, empty
