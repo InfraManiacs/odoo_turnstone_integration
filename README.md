@@ -188,6 +188,18 @@ node the rendezvous hash placed it on, so `/workstreams/{id}/history` returns
 nothing for it. This module reads `/cluster/ws/{id}/detail`, the one surface that
 returns the persisted row, the live block and the message tail together.
 
+**A session with no workstream is a draft, and saying otherwise loses the
+message.** Turnstone can answer a create with HTTP 200 and no usable `ws_id` —
+an unroutable node, a half-initialised workstream — and a `ws_id` that is
+simply absent is not a session. So a create response without one raises, naming
+what the server said, and writes nothing: the session stays `draft` and the
+message stays in the composer. A create response that carries `error` raises
+too, even if a `ws_id` rides along with it, for the same reason a detail
+response with `error` is an error rather than an empty conversation. Before
+this, that path filed the session as `thinking` with no workstream, and the
+user's first message existed in neither Odoo nor Turnstone with no error
+anywhere — the one shape in this module that destroyed typed input.
+
 **The transcript is replaced, not appended — but only with a response that
 IS the transcript.** Turnstone can rewind or retry a turn, which removes
 messages, so diffing an append-only mirror against a mutable source is how you

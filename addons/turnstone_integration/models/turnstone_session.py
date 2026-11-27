@@ -179,7 +179,28 @@ class TurnstoneSession(models.Model):
     # -- lifecycle ---------------------------------------------------------
 
     def _ensure_started(self, first_message=None):
-        """Create the workstream on Turnstone if this session has none yet."""
+        """Create the workstream on Turnstone if this session has none yet.
+
+        A create that comes back without a ``ws_id`` is a FAILURE, not a
+        session with an empty id. The console answers an unroutable node or a
+        half-initialised workstream with HTTP 200 and either ``{}`` or
+        ``{"error": …}``, and treating that as success is the one shape in
+        this module that silently destroys something the user typed: the
+        session got ``state=thinking``, ``ws_id`` stayed empty, nothing was
+        mirrored, ``action_send`` short-circuited on the falsy id, and the
+        message the user had just written existed in neither Odoo nor
+        Turnstone, with no error anywhere (OTI-5729 shape 1, RC-1).
+
+        So: no id, no write. The session stays ``draft`` — which is what it
+        truthfully is — the message is still in the user's composer (the
+        client restores it on an error), and the raise names the response so
+        the reason is visible.
+
+        A body carrying ``error`` raises even when it also carries a ``ws_id``,
+        which is the same reading ``_fetch_detail`` applies to a detail response
+        (OTI-5744): the console says an error when it means one, and a
+        half-built workstream it flagged is not one to start writing into.
+        """
         self.ensure_one()
         if self.ws_id:
             return self.ws_id
@@ -197,13 +218,58 @@ class TurnstoneSession(models.Model):
             auto_approve=agent.auto_approve or None,
             auto_approve_tools=agent.auto_approve_tool_list() if agent else None,
         )
+        ws_id = result.get("ws_id") if isinstance(result, dict) else None
+        if not ws_id or result.get("error"):
+            # Nothing is written here, deliberately. The session's own state,
+            # ws_id and last_activity stay exactly as they were before the
+            # call, so a retry starts from the same clean draft. No audit row
+            # either: the raise rolls the whole request transaction back, so an
+            # audit entry written on this path would never survive — the log
+            # line below and the exception are the honest surface.
+            detail = self._describe_create_response(result)
+            _logger.warning(
+                "Turnstone created no workstream for session %s: %s", self.id, detail,
+            )
+            raise TurnstoneError(_(
+                "Turnstone did not start this session: its create response carried no "
+                "usable workstream id (%(detail)s). Nothing was sent, so your message "
+                "was not lost — send it again, and if this repeats check the server's "
+                "routing and node health.",
+            ) % {"detail": detail})
         self.sudo().write({
-            "ws_id": result.get("ws_id"),
+            "ws_id": ws_id,
             "node_id": result.get("node_id"),
             "state": "thinking" if first_message else "idle",
             "last_activity": fields.Datetime.now(),
         })
         return self.ws_id
+
+    def _describe_create_response(self, result, limit=300):
+        """What a workstream-less create response said, for the error and the log.
+
+        Truncated, because it goes in a chat toast. Tokens are not in a create
+        response — the console echoes the workstream it made — but the
+        truncation is what keeps a proxy's HTML error page from becoming a wall
+        of text in the UI.
+
+        An instance method rather than a staticmethod for a reason that is not
+        cosmetic: ``_()`` locates the language through ``self.env`` on the
+        calling frame, and from a staticmethod there is no ``self``, so every
+        call logged "no translation language detected" with a stack trace. The
+        translation fell back to the source string either way, so the output was
+        never wrong — only the log was.
+        """
+        if not isinstance(result, dict):
+            return _("not an object but a %s") % type(result).__name__
+        if result.get("error"):
+            return _("Turnstone reported: %s") % str(result["error"])[:limit]
+        if not result:
+            return _("an empty response")
+        try:
+            rendered = json.dumps(result, default=str, sort_keys=True)
+        except (TypeError, ValueError):
+            rendered = repr(result)
+        return rendered[:limit] + ("…" if len(rendered) > limit else "")
 
     def action_send(self, body):
         """Send a user message and mirror it immediately.
@@ -224,6 +290,18 @@ class TurnstoneSession(models.Model):
         else:
             self.connection_id._client().send(self.ws_id, body, kind=self.kind)
 
+        # Only a session that HAS a workstream can be working. This is a
+        # backstop, not the primary check: _ensure_started raises rather than
+        # returning without an id, so by here the id exists or we never got
+        # here. It stays because the invariant is the whole point of this fix —
+        # `thinking` written over a session with nothing behind it is the ghost
+        # that used to swallow the first message — and one field read is cheap
+        # insurance against a future caller reintroducing it.
+        if not self.ws_id:
+            raise TurnstoneError(_(
+                "This session has no Turnstone workstream, so the message was not "
+                "sent. Nothing was recorded as working.",
+            ))
         self.sudo().write({"state": "thinking", "last_activity": fields.Datetime.now()})
         self.env["turnstone.audit.log"].log(
             "message_send", session=self, detail=body[:500],
