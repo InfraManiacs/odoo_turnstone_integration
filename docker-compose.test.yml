@@ -77,6 +77,13 @@ services:
       PGPORT: "5432"
       PGUSER: odoo
       PGPASSWORD: odoo
+      # How a test finds the mock. The token is generated per run, so it cannot
+      # be defaulted in the code: the fixture reads these (see
+      # addons/turnstone_integration/tests/common.py) and refuses to talk to
+      # anything but this host. The URL carries no /v1/api — TurnstoneClient
+      # appends that itself.
+      OTI_MOCK_TURNSTONE_URL: http://mock-turnstone:8099
+      MOCK_TURNSTONE_TOKEN: ${OTI_TEST_TOKEN:?scripts/test-odoo.sh sets OTI_TEST_TOKEN}
     volumes:
       # Read-only: a test run must not be able to leave __pycache__ in the
       # working tree, and it is the only mount the tests actually need.
