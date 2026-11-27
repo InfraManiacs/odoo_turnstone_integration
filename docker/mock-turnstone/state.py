@@ -32,7 +32,12 @@ OTI-5736 adds the transcript, OTI-5738 appends turns and moves the counters):
     name                 the name the caller asked for
     title                the title Turnstone would generate from the first turn
     skill, persona       catalogue names or None
-    model_alias          alias string or None
+    model_alias          the alias it runs on, defaulting to DEFAULT_MODEL_ALIAS. The
+                         routing proxy's `model` sets it explicitly; a coordinator
+                         gets the node default because the console create endpoint
+                         has no `model` field at all. Never None: reporting None would
+                         say "this session has no model", which a real cluster does
+                         not, and `controllers/main.py` harvests aliases from this feed.
     parent_ws_id         the coordinator that spawned this child, or None
     node_id              which node "hosts" it (always NODE_ID here)
     created_at, updated_at  epoch seconds (float)
@@ -115,6 +120,15 @@ DEFAULT_MODELS = (
         "output_cost": 0.0,
     },
 )
+
+# The alias a session runs on when the caller could not choose one.
+#
+# A coordinator is exactly that case: the console create endpoint has no `model`
+# field, so a coordinator runs on the node's default. Reporting None instead
+# would say "this session has no model", which is not what a real cluster says —
+# and `controllers/main.py` harvests model aliases from the cluster feed, so a
+# cluster of coordinators would suggest nothing in the new-session form.
+DEFAULT_MODEL_ALIAS = DEFAULT_MODELS[0]["alias"]
 
 # How many requests the log keeps. Bounded because a chat polls every couple of
 # seconds for as long as a test runs; the counter keeps counting past the cap so
@@ -215,7 +229,7 @@ class MockState:
                 "title": title,
                 "skill": skill,
                 "persona": persona,
-                "model_alias": model_alias or (None if kind == "coordinator" else "mock-model"),
+                "model_alias": model_alias or DEFAULT_MODEL_ALIAS,
                 "parent_ws_id": parent_ws_id,
                 "node_id": NODE_ID,
                 "created_at": now,
@@ -259,6 +273,46 @@ class MockState:
         """Every workstream as a copy, oldest first."""
         with self.lock:
             return [copy.deepcopy(self.workstreams[k]) for k in self.workstreams]
+
+    def list_workstreams(self, state=None, search=None, page=1, per_page=100):
+        """One page of workstreams, oldest first, plus the unpaged total.
+
+        Filtering and paging live here rather than in the handler because a
+        listing endpoint means one thing by "page 2" and the record contract is
+        defined in this module, so the query over it is too.
+
+        `state` is an exact match on the Turnstone state string. `search`
+        matches the id, name or title, case-insensitively — the three things a
+        person types into a cluster search box. Both filters are applied
+        **before** paging, so `total` is how many workstreams match, not how
+        many the page holds.
+
+        Order is creation order (oldest first), the same order `all()` gives and
+        the same order ids are handed out in, so an assertion can name positions
+        instead of sorting. A caller that wants newest-first sorts the page.
+        """
+        with self.lock:
+            rows = [copy.deepcopy(self.workstreams[k]) for k in self.workstreams]
+        if state:
+            rows = [r for r in rows if r.get("state") == state]
+        if search:
+            needle = search.lower()
+            rows = [
+                r for r in rows
+                if needle in str(r.get("id") or "").lower()
+                or needle in str(r.get("name") or "").lower()
+                or needle in str(r.get("title") or "").lower()
+            ]
+        total = len(rows)
+        page = max(1, int(page or 1))
+        per_page = max(1, int(per_page or 100))
+        start = (page - 1) * per_page
+        return {
+            "rows": rows[start:start + per_page],
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+        }
 
     def exists(self, ws_id):
         with self.lock:

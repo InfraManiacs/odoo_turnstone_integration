@@ -266,6 +266,8 @@ class Context:
         self.store = state.STORE
         self._json = None
         self._json_error = None
+        self._session = None
+        self._session_resolved = False
 
     # -- parsed input ------------------------------------------------------
 
@@ -317,7 +319,28 @@ class Context:
           (the exact body Turnstone's console returns; the README quotes it)
         * route path, coordinator     -> 404 (the routing proxy hosts only
           interactive sessions; a bare 404, as the proxy gives)
+
+        Memoised for the life of one request. The dispatcher resolves every
+        `session=True` route before the handler runs, and a handler that needs
+        the record (session detail) asks again; without the memo that is two
+        store round trips and, worse, two answers that could disagree if the
+        record changed in between. One request, one resolution.
         """
+        if self._session_resolved:
+            if isinstance(self._session, HttpError):
+                raise self._session
+            return self._session
+        try:
+            self._session = self._lookup_session()
+        except HttpError as exc:
+            self._session = exc
+            raise
+        finally:
+            self._session_resolved = True
+        return self._session
+
+    def _lookup_session(self):
+        """The store lookup and split check behind `resolve_session`."""
         ws_id = self.ws_id()
         record = self.store.get(ws_id)
         if record is None:
@@ -435,6 +458,292 @@ def handle_cluster_overview(ctx):
         },
         "node_id": state.NODE_ID,
         "mock": True,
+    }
+
+
+# ---------------------------------------------------------------------------
+# handlers: workstream creation
+#
+# Creation obeys the same console/route split as everything else, and the split
+# is expressed by having TWO routes with two handlers rather than one handler
+# that branches on `ctx.route.surface`. There is no shared "create" that could
+# be pointed at the wrong surface: the console handler can only make a
+# coordinator and the proxy handler can only make an interactive session, which
+# is exactly what the real API can do. Rejecting a coordinator through the
+# proxy is therefore schema validation (kind is not a value that surface
+# accepts), not the per-session prefix check in `resolve_session`.
+# ---------------------------------------------------------------------------
+
+
+def _optional_str(body, name):
+    """A string field, or None. An integer or list is a caller mistake, not a value."""
+    value = body.get(name)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise bad_request("%s must be a string" % name)
+    value = value.strip()
+    return value or None
+
+
+def _creation_meta(body, allowed):
+    """The request fields this mock records but does not act on.
+
+    Turnstone's create endpoints take settings the mock has no behaviour for
+    (`client_type`, `judge_model`, the auto-approve lists). Dropping them would
+    make "what did Odoo ask for" unanswerable, and inventing behaviour for them
+    would be worse, so they are kept on the record under `meta` where a test can
+    assert them and nothing else reads them.
+    """
+    meta = {}
+    for name in allowed:
+        if name in body and body[name] is not None:
+            meta[name] = body[name]
+    return meta
+
+
+def handle_create_workstream_console(ctx):
+    """POST /v1/api/workstreams/new — the console's create, coordinators only.
+
+    The console endpoint takes `name`, `skill`, `persona` and `initial_message`
+    and nothing else. It has no `kind` and no `model` in its schema: it always
+    makes a coordinator, which runs on the node's default alias, and its
+    children are the only sessions a model may be chosen for.
+
+    That is a trap worth reproducing rather than guarding against — a caller
+    that asks the console for an interactive session gets a coordinator on the
+    real server, silently — so a `kind` in the body is ignored and the response
+    says `coordinator`. A test that wants the other behaviour must use the
+    proxy, and the response is where it finds out it did not.
+
+    `initial_message` becomes the first user turn of the stored transcript. The
+    assistant side is OTI-5738's canned reply; this server performs no work, so
+    the state stays `idle` rather than pretending to be `thinking` forever.
+    """
+    body = ctx.json_body()
+    if not isinstance(body, dict):
+        raise bad_request("create body must be a JSON object")
+    initial = _optional_str(body, "initial_message")
+    record = state.STORE.create_workstream(
+        kind="coordinator",
+        name=_optional_str(body, "name"),
+        skill=_optional_str(body, "skill"),
+        persona=_optional_str(body, "persona"),
+        # No model_alias: this endpoint has no `model` field to set one with, so
+        # the store's DEFAULT_MODEL_ALIAS applies, which is the node default a
+        # real coordinator runs on. A `model` sent here is not in the schema and
+        # is not recorded either — the console would silently ignore it.
+        messages=_initial_turn(initial),
+        meta=_creation_meta(body, ("kind",)),
+    )
+    return 201, _creation_response(record, surface="console")
+
+
+def handle_create_workstream_route(ctx):
+    """POST /v1/api/route/workstreams/new — the proxy's create, interactive only.
+
+    The routing proxy is the only surface that accepts `kind`, `model`,
+    `judge_model` and the auto-approve fields, because it is the only surface
+    that creates a session on a node. `kind` defaults to `interactive` (a
+    proxied session is one by definition); any other value is refused, and
+    `coordinator` gets the pointer to the console rather than a generic 400 —
+    that is the one mistake this endpoint exists to catch.
+    """
+    body = ctx.json_body()
+    if not isinstance(body, dict):
+        raise bad_request("create body must be a JSON object")
+    kind = body.get("kind")
+    if kind is None:
+        kind = "interactive"
+    if kind == "coordinator":
+        raise bad_request(
+            "kind 'coordinator' cannot be created through the routing proxy",
+            detail="coordinator workstreams must be created on the console via "
+                   "POST /v1/api/workstreams/new",
+        )
+    if kind != "interactive":
+        raise bad_request("kind must be 'interactive' through the routing proxy", kind=kind)
+
+    initial = _optional_str(body, "initial_message")
+    record = state.STORE.create_workstream(
+        kind="interactive",
+        name=_optional_str(body, "name"),
+        skill=_optional_str(body, "skill"),
+        persona=_optional_str(body, "persona"),
+        model_alias=_optional_str(body, "model"),
+        messages=_initial_turn(initial),
+        meta=_creation_meta(body, ("client_type", "judge_model", "auto_approve",
+                                   "auto_approve_tools")),
+    )
+    return 201, _creation_response(record, surface="route")
+
+
+def _initial_turn(initial_message):
+    """The first user turn, if the caller supplied one. There is no reply here:
+    this server runs no model, so a created session has the prompt and nothing
+    else until OTI-5738 appends a canned answer."""
+    if not initial_message:
+        return []
+    return [{"role": "user", "content": initial_message}]
+
+
+def _creation_response(record, surface):
+    """What a create endpoint answers.
+
+    `ws_id` and `node_id` are at the top level because that is exactly what
+    `turnstone_session._ensure_started` reads, and it writes them straight onto
+    the Odoo row. A body without `ws_id` is failure mode 1 in the persistence
+    investigation — the user's first message silently goes nowhere — so this
+    endpoint always answers with one.
+
+    The whole record is included under `workstream` as well, so a test can read
+    the created state without a second request, and `surface` says which
+    endpoint made it. No `error` key on success: a 200 with an `error` key is
+    parsed by the addon as an empty session.
+    """
+    return {
+        "ws_id": record["id"],
+        "node_id": record["node_id"],
+        "kind": record["kind"],
+        "state": record["state"],
+        "name": record["name"],
+        "title": record["title"],
+        "skill": record["skill"],
+        "persona": record["persona"],
+        "model_alias": record["model_alias"],
+        "parent_ws_id": record["parent_ws_id"],
+        "created_at": record["created_at"],
+        "surface": surface,
+        "workstream": record,
+    }
+
+
+# ---------------------------------------------------------------------------
+# handlers: cluster-wide reads
+# ---------------------------------------------------------------------------
+
+
+def _feed_row(record):
+    """One row of the cluster feed.
+
+    The keys are the ones `turnstone_session._children` and
+    `controllers/main.py::cluster_activity` read by name: `id` (not `ws_id`),
+    `title`/`name`, `kind`, `parent_ws_id`, counters, and a model alias under
+    both spellings the controller accepts. `node` and `node_id` carry the same
+    value for the same reason — the controller reads `node`, the record stores
+    `node_id`.
+
+    A row is a summary, not the whole record: `messages` is deliberately absent
+    (a 200-row feed that each carried a transcript would be enormous), and the
+    transcript is what `/cluster/ws/{id}/detail` is for.
+    """
+    return {
+        "id": record["id"],
+        "ws_id": record["id"],
+        "kind": record["kind"],
+        "state": record["state"],
+        "name": record["name"],
+        "title": record["title"],
+        "skill": record["skill"],
+        "persona": record["persona"],
+        "model_alias": record["model_alias"],
+        "model": record["model_alias"],
+        "parent_ws_id": record["parent_ws_id"],
+        "node": record["node_id"],
+        "node_id": record["node_id"],
+        "created_at": record["created_at"],
+        "updated_at": record["updated_at"],
+        "tokens": record["tokens"],
+        "tool_calls": record["tool_calls"],
+        "context_ratio": record["context_ratio"],
+        "activity": record["activity"],
+        "activity_state": record["activity_state"],
+        "closed": record["closed"],
+    }
+
+
+def handle_cluster_workstreams(ctx):
+    """GET /v1/api/cluster/workstreams — every workstream, whoever started it.
+
+    This is also how the addon finds child workstreams, because
+    `/workstreams/{id}/children` is coordinator-only and every row here carries
+    `parent_ws_id`. Filtering and paging are applied to the store's list before
+    the page is cut, so `total` counts matches and not the page size.
+    """
+    page = ctx.int_arg("page", 1)
+    per_page = ctx.int_arg("per_page", 100)
+    if page < 1:
+        raise bad_request("page must be 1 or greater")
+    if per_page < 1:
+        raise bad_request("per_page must be 1 or greater")
+    result = ctx.store.list_workstreams(
+        state=ctx.arg("state") or None,
+        search=ctx.arg("search") or None,
+        page=page,
+        per_page=per_page,
+    )
+    return 200, {
+        "workstreams": [_feed_row(row) for row in result["rows"]],
+        "total": result["total"],
+        "page": result["page"],
+        "per_page": result["per_page"],
+        "node_id": state.NODE_ID,
+    }
+
+
+def handle_session_detail(ctx):
+    """GET /v1/api/cluster/ws/{ws_id}/detail — one session, from any node.
+
+    The one surface that answers for either kind, and the only one the addon
+    reads a session's authoritative state from (`sync_from_server`). Three
+    blocks, because the client treats them as three:
+
+    * `persisted` — the row as stored: `ws_id` (adopt() refuses a session without
+      it), kind, parent, persona, node, state, title/name, model, timestamps.
+    * `live` — the counters and the moment-to-moment fields: state, tokens,
+      tool_calls, context_ratio, activity, activity_state, title, and
+      `pending_approval_details` (a non-empty list is what the addon maps to
+      `attention`).
+    * `messages` — the transcript. Present and empty rather than missing when
+      there are no turns: `detail.get("messages") or []` cannot tell "absent"
+      from "empty", and a missing key is how a real sync wipes a good mirror.
+      OTI-5736 owns the transcript's message shapes; this returns whatever
+      seeding (or a create's `initial_message`) put there.
+    """
+    record = ctx.resolve_session()
+    return 200, {
+        "persisted": {
+            "ws_id": record["id"],
+            "id": record["id"],
+            "kind": record["kind"],
+            "state": record["state"],
+            "name": record["name"],
+            "title": record["title"],
+            "skill": record["skill"],
+            "persona": record["persona"],
+            "model_alias": record["model_alias"],
+            "model": record["model_alias"],
+            "parent_ws_id": record["parent_ws_id"],
+            "node_id": record["node_id"],
+            "created_at": record["created_at"],
+            "updated_at": record["updated_at"],
+            "closed": record["closed"],
+        },
+        "live": {
+            "ws_id": record["id"],
+            "kind": record["kind"],
+            "state": record["state"],
+            "title": record["title"],
+            "model_alias": record["model_alias"],
+            "tokens": record["tokens"],
+            "tool_calls": record["tool_calls"],
+            "context_ratio": record["context_ratio"],
+            "activity": record["activity"],
+            "activity_state": record["activity_state"],
+            "pending_approval_details": record["pending_approval_details"],
+            "node_id": record["node_id"],
+        },
+        "messages": record["messages"],
     }
 
 
@@ -599,23 +908,21 @@ ROUTES = [
           note="Schedules screen; nothing in story OTI-698 claims this yet"),
 
     # -- workstream creation (console/route split) -------------------------
-    Route("POST", "/v1/api/workstreams/new",
-          reserved("OTI-5734", "coordinator creation on the console"),
+    # Two routes, two handlers: the console can only make a coordinator and the
+    # proxy can only make an interactive session, exactly as the real API does.
+    Route("POST", "/v1/api/workstreams/new", handle_create_workstream_console,
           surface="console",
           note="console only, and only ever coordinators: takes no kind and no model"),
-    Route("POST", "/v1/api/route/workstreams/new",
-          reserved("OTI-5734", "interactive creation through the routing proxy"),
+    Route("POST", "/v1/api/route/workstreams/new", handle_create_workstream_route,
           surface="route",
-          note="the only surface accepting kind; console would hand back a coordinator"),
+          note="the only surface accepting kind; a coordinator here is refused"),
 
     # -- cluster-wide reads ------------------------------------------------
     Route("GET", "/v1/api/cluster/overview", handle_cluster_overview,
           note="summary strip on Live Activity"),
-    Route("GET", "/v1/api/cluster/workstreams",
-          reserved("OTI-5734", "cluster workstream feed"),
-          note="feed used for children and Live Activity; row shape lands with the list ticket"),
-    Route("GET", "/v1/api/cluster/ws/{ws_id}/detail",
-          reserved("OTI-5734", "session detail"),
+    Route("GET", "/v1/api/cluster/workstreams", handle_cluster_workstreams,
+          note="the feed used for children and Live Activity: page/per_page/state/search"),
+    Route("GET", "/v1/api/cluster/ws/{ws_id}/detail", handle_session_detail,
           session=True,
           note="the one surface returning persisted + live + messages for any node"),
 
