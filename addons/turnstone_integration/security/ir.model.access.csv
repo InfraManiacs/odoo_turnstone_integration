@@ -17,3 +17,6 @@ access_turnstone_skill_user,turnstone.skill user,model_turnstone_skill,group_tur
 access_turnstone_skill_manager,turnstone.skill manager,model_turnstone_skill,group_turnstone_manager,1,1,1,1
 access_turnstone_persona_user,turnstone.persona user,model_turnstone_persona,group_turnstone_user,1,0,0,0
 access_turnstone_persona_manager,turnstone.persona manager,model_turnstone_persona,group_turnstone_manager,1,1,1,1
+access_turnstone_automation_manager,turnstone.automation manager,model_turnstone_automation,group_turnstone_manager,1,1,1,1
+access_turnstone_automation_run_user,turnstone.automation.run user,model_turnstone_automation_run,group_turnstone_user,1,0,0,0
+access_turnstone_automation_run_manager,turnstone.automation.run manager,model_turnstone_automation_run,group_turnstone_manager,1,1,1,0
