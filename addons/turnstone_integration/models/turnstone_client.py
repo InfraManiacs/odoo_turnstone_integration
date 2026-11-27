@@ -27,6 +27,27 @@ DEFAULT_TIMEOUT = 30
 # dispatched, and a tool-heavy turn is slower still.
 LONG_TIMEOUT = 120
 
+# How many conversation rows a session detail read asks for.
+#
+# `GET /cluster/ws/{id}/detail` takes exactly one query parameter,
+# `message_limit` -- "Max conversation rows in the tail (default 20, clamped to
+# 200)" -- and two things about it are easy to miss, both of which cost real
+# history:
+#
+#   * the default is 20, and the rows are the TAIL: the last 20 turns, not the
+#     first. A client that sends nothing gets a truncated conversation;
+#   * the response carries no `total`, `has_more` or `offset`, so a caller that
+#     receives 20 rows cannot tell a tail from a whole transcript.
+#
+# Sending nothing is therefore not a neutral default. On a real Turnstone 1.8.3,
+# 82 of 107 workstreams answered at exactly 20 rows with no limit sent, and all
+# 82 were truncated when asked for 500 -- 7,698 turns never served (OTI-5763).
+# 200 is the server's hard clamp: asking for more does not help. It is still a
+# tail for the sessions that exceed 200 rows, but that is for the sync guard to
+# disclose (OTI-5772), not something this call can fix. Do not put this
+# parameter on any other endpoint: none of them accept it.
+SESSION_DETAIL_MESSAGE_LIMIT = 200
+
 
 class TurnstoneError(UserError):
     """A Turnstone API call failed in a way the user should see."""
@@ -282,8 +303,18 @@ class TurnstoneClient:
         An interactive session lives on whichever node the rendezvous hash
         placed it on, and the console's own /workstreams/{id}/history does NOT
         see it. This cluster-wide endpoint is the one surface that returns both.
+
+        Always asks for the whole tail the server will give
+        (``SESSION_DETAIL_MESSAGE_LIMIT``). Leaving the parameter off is not a
+        neutral default: the server answers with the last 20 turns, says nothing
+        about having done so, and a mirror fed from that response silently
+        drops the oldest turns of every conversation longer than 20 (OTI-5763).
         """
-        return self._request("GET", "/cluster/ws/%s/detail" % ws_id)
+        return self._request(
+            "GET",
+            "/cluster/ws/%s/detail" % ws_id,
+            params={"message_limit": SESSION_DETAIL_MESSAGE_LIMIT},
+        )
 
     def send(self, ws_id, message, kind=None):
         return self._request(
