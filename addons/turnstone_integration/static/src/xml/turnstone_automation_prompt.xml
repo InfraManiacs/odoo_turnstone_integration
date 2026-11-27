@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<templates xml:space="preserve">
+
+    <!--
+        The prompt textarea, plus one button that inserts a `{{ field }}`
+        reference. Inherits web.TextField so the textarea itself keeps every
+        behaviour Odoo gives it (autoresize, translation button, dirty tracking);
+        only the button is added.
+
+        The button lives in the field's own `o_field_input_buttons` slot, which
+        web shows on hover or focus — the same place and the same affordance as
+        the dynamic-placeholder button on a mail template, so an administrator
+        who has used one recognises the other.
+    -->
+    <t t-name="turnstone_integration.PromptTemplateField"
+       t-inherit="web.TextField" t-inherit-mode="primary">
+        <xpath expr="//*[hasclass('o_field_input_buttons')]" position="inside">
+            <button type="button"
+                    class="btn m-0 py-2 px-2 fa fa-magic position-relative"
+                    t-on-click="openFieldSelector"
+                    t-att-title="targetModel ? 'Insert a field reference' : 'Pick a target model first'"
+                    t-att-aria-label="targetModel ? 'Insert a field reference' : 'Pick a target model first'"/>
+        </xpath>
+    </t>
+
+</templates>
