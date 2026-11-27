@@ -89,6 +89,33 @@ function writeStoredSession(uid, storage, value) {
 }
 
 /**
+ * What to tell the user when a send does not complete.
+ *
+ * `rpc()` does not return a body for a call that never finished: it *rejects*,
+ * with a `ConnectionLostError` (dropped connection, non-JSON answer) or an
+ * `RPCError` (a JSON-RPC error body: an uncaught server exception, an expired
+ * session). Both carry something worth showing, so use the most specific part
+ * each one has rather than one vague sentence for every failure.
+ *
+ * Deliberately silent about where the text went: `failedSend` knows whether it
+ * went back into the open composer or was held for another session, and says so.
+ */
+function sendFailureMessage(error) {
+    if (error && error.url) {
+        // ConnectionLostError: no response at all, which does not say whether
+        // the server acted on the request, so do not claim it did or did not.
+        return _t("The connection to the server was lost, so this message may not have been sent.");
+    }
+    // RPCError: `data.message` is the server's own text ("Session expired");
+    // `message` is the JSON-RPC short form. `data.debug` is a full traceback
+    // and must never be shown to a user.
+    const detail = (error && error.data && error.data.message) || (error && error.message);
+    return detail
+        ? _t("The message could not be sent (%s).", detail)
+        : _t("The message could not be sent.");
+}
+
+/**
  * Turnstone chat client.
  *
  * Talks only to this module's Odoo controllers, never to Turnstone directly —
@@ -156,6 +183,9 @@ export class TurnstoneChat extends Component {
         // Where "back" goes, so descending into a subagent and returning is one
         // click rather than hunting the parent in the sidebar.
         this.navStack = [];
+        // Failed sends whose session was no longer open when the failure landed
+        // (see restoreDraft / pickUpPendingDraft).
+        this._pendingDrafts = new Map();
 
         // A background tab should not keep polling, but coming back to it
         // should feel instant rather than waiting out the next interval.
@@ -262,6 +292,7 @@ export class TurnstoneChat extends Component {
         await this.loadAttachments();
         this.maybePoll();
         this.rememberSession();
+        this.pickUpPendingDraft(this.state.session.id);
         return true;
     }
 
@@ -748,21 +779,116 @@ export class TurnstoneChat extends Component {
         this.rememberSession();
     }
 
+    /**
+     * Put a message that did not reach Turnstone back in the composer.
+     *
+     * The text was cleared before the call, so a send that fails in any way has
+     * to give it back or the user's turn exists nowhere — it was never sent and
+     * they cannot see it any more.
+     *
+     * Two cases must not be clobbered by that restore:
+     *  - the session changed while the call was in flight (a poll cannot do it,
+     *    but navigating or the sidebar can): the text belongs to the
+     *    conversation it was typed in, and putting it into another one is a
+     *    message to the wrong agent. It is held for that session instead —
+     *    `pickUpPendingDraft()` gives it back when the user returns, so the
+     *    text is not lost either way;
+     *  - the user typed something new in the meantime, which the send did not
+     *    block: that text is at least as valuable, so the failed message is put
+     *    back *in front of* it — oldest first, as in the transcript — rather
+     *    than replacing it.
+     */
+    restoreDraft(sessionId, body) {
+        const s = this.state.session;
+        if (!s || s.id !== sessionId) {
+            // Hold it against the conversation it was typed in. Bounded on
+            // purpose: only a failed send lands here, and each one replaces its
+            // session's entry, so this can never hold more than one message per
+            // session that has an unsent one.
+            this._pendingDrafts.set(sessionId, body);
+            return false;
+        }
+        const typed = this.state.draft;
+        this.state.draft = typed.trim() ? `${body}\n\n${typed}` : body;
+        return true;
+    }
+
+    /**
+     * Give back a message whose send failed while another session was open.
+     *
+     * Opening is the moment the user is looking at that conversation again, so
+     * it is the moment the text belongs back in front of them. Merged with
+     * whatever else is in the box rather than replacing it, same as above.
+     */
+    pickUpPendingDraft(sessionId) {
+        const pending = this._pendingDrafts.get(sessionId);
+        if (!pending) {
+            return;
+        }
+        this._pendingDrafts.delete(sessionId);
+        const typed = this.state.draft;
+        this.state.draft = typed.trim() ? `${pending}\n\n${typed}` : pending;
+    }
+
+    /**
+     * A send did not complete: give the text back, say so, and keep watching.
+     *
+     * `fail()` stops the poll loop, which is the right default for an action
+     * that failed outright — retrying it on every interval would just repeat
+     * the toast. A send is the exception: the turn may still have reached
+     * Turnstone even though the answer did not come back (the investigation
+     * recorded a transaction retry that POSTed the message and then failed), so
+     * leaving the loop stopped hides the agent's reply until the user happens to
+     * click something. Restart it here, at the same interval `maybePoll()`
+     * already picks — the detection cadence is unchanged.
+     */
+    failedSend(sessionId, body, message) {
+        const restored = this.restoreDraft(sessionId, body);
+        // Say where the text went: a sentence that claims "back in the box" when
+        // it was held for another session is worse than saying nothing.
+        this.fail(
+            restored
+                ? `${message} ${_t("Your text is back in the box.")}`
+                : `${message} ${_t(
+                      "Your text is kept with the conversation you sent it from, and comes " +
+                          "back when you reopen that session."
+                  )}`
+        );
+        // fail() stops the loop; a send may have reached Turnstone anyway, so
+        // keep watching for the reply.
+        this.maybePoll();
+    }
+
     async send() {
         const body = this.state.draft.trim();
         if (!body || this.state.sending || !this.state.session) {
             return;
         }
+        // Remember which conversation the text belongs to: everything below
+        // can find a different session in state.session.
+        const sessionId = this.state.session.id;
         this.state.sending = true;
         this.state.draft = "";
-        const res = await rpc("/turnstone/session/send", {
-            session_id: this.state.session.id,
-            body,
-        });
-        this.state.sending = false;
+        let res;
+        try {
+            res = await rpc("/turnstone/session/send", {
+                session_id: sessionId,
+                body,
+            });
+        } catch (error) {
+            // The call never completed: a dropped connection, an HTTP 500, an
+            // expired session, or a transaction retry that ran out. There is no
+            // `res.error` on this path, so restoring the draft only in the
+            // branch below would silently eat what the user typed.
+            return this.failedSend(sessionId, body, sendFailureMessage(error));
+        } finally {
+            // Also reached when the RPC threw, so a failed send cannot leave the
+            // composer stuck in its sending state.
+            this.state.sending = false;
+        }
         if (res.error) {
-            this.state.draft = body; // give the text back rather than losing it
-            return this.fail(res.error);
+            // Give the text back rather than losing it.
+            return this.failedSend(sessionId, body, res.error);
         }
         this.state.session = res.session;
         this.state.sessions = res.sessions || this.state.sessions;
