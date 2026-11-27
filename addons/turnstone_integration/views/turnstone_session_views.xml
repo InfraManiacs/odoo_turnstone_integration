@@ -62,6 +62,11 @@
                             <field name="last_activity"/>
                         </group>
                     </group>
+                    <div class="alert alert-warning" role="alert"
+                         invisible="not remote_gone and not sync_note">
+                        <field name="remote_gone" invisible="1"/>
+                        <field name="sync_note" nolabel="1"/>
+                    </div>
                     <notebook>
                         <page string="Transcript" name="transcript">
                             <field name="message_ids" readonly="1">

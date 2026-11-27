@@ -184,9 +184,25 @@ node the rendezvous hash placed it on, so `/workstreams/{id}/history` returns
 nothing for it. This module reads `/cluster/ws/{id}/detail`, the one surface that
 returns the persisted row, the live block and the message tail together.
 
-**The transcript is replaced, not appended.** Turnstone can rewind or retry a
-turn, which removes messages. Diffing an append-only mirror against a mutable
-source is how you end up showing a reply that was taken back.
+**The transcript is replaced, not appended — but only with a response that
+IS the transcript.** Turnstone can rewind or retry a turn, which removes
+messages, so diffing an append-only mirror against a mutable source is how you
+end up showing a reply that was taken back. What that must not turn into is
+"replace with whatever arrived": a node that has not loaded history yet answers
+with an empty or missing message list, and a long conversation can come back as
+a bounded tail. Applying either deletes turns that still exist on the server.
+So a sync applies a shorter list only when it is a **prefix** of what is stored
+(a rewind drops the tail; a partial view drops the head), a rewind says so
+explicitly, and anything else is refused with the reason kept on the session in
+`sync_note`. Only a **404** clears a transcript, and it sets `remote_gone` and
+logs `sync_remote_gone` so an empty transcript always has a reason attached.
+
+**A failed read never touches the mirror.** Transport errors, a non-JSON body,
+and an HTTP 200 carrying `{"error": …}` (which is what the console answers for
+a session it cannot serve) all raise before anything is written, so the chat
+shows an error and the transcript stays exactly as it was. The header and the
+transcript are applied together in one savepoint, so a failure part-way cannot
+leave half a transcript.
 
 **Coordinators and interactive sessions are driven through different APIs.**
 A coordinator is hosted by the console (`/workstreams/{id}/...`); an interactive

@@ -32,6 +32,17 @@ class TurnstoneError(UserError):
     """A Turnstone API call failed in a way the user should see."""
 
 
+class TurnstoneNotFound(TurnstoneError):
+    """Turnstone answered HTTP 404: the resource is not there any more.
+
+    A subclass so every existing ``except TurnstoneError`` still catches it.
+    It exists because 404 means something different from every other failure
+    for a session: the workstream is gone, rather than unreachable, and only a
+    caller that can tell the two apart may act on the difference. The same
+    message text is useless for that decision -- it is translated.
+    """
+
+
 class TurnstoneClient:
     """Stateless wrapper around one Turnstone server's HTTP API."""
 
@@ -75,7 +86,7 @@ class TurnstoneClient:
                       "and that it has not been revoked.") % exc.code
                 ) from exc
             if exc.code == 404:
-                raise TurnstoneError(
+                raise TurnstoneNotFound(
                     _("Turnstone has no such resource (HTTP 404 on %s). The session may have been "
                       "deleted on the server.") % path
                 ) from exc
