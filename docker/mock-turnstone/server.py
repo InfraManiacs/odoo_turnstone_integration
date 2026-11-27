@@ -573,6 +573,16 @@ def handle_create_workstream_route(ctx):
     proxied session is one by definition); any other value is refused, and
     `coordinator` gets the pointer to the console rather than a generic 400 —
     that is the one mistake this endpoint exists to catch.
+
+    **A caller-supplied `ws_id` is honoured verbatim, and a repeat is 409.**
+    This is not a convenience: it is the only idempotency the real API offers,
+    and OTI-5767's send fix depends on it. Verified against Turnstone 1.8.3 —
+    the second create with the same id answers
+    `409 {"error": "Workstream already exists"}` rather than making another
+    workstream (OTI-5763 Q3). The spec calls `ws_id` a routing hint; it behaves
+    as an idempotency key for JSON callers because the destination id is
+    reserved before the body lands, so the mock reproduces the behaviour rather
+    than the documentation.
     """
     body = ctx.json_body()
     if not isinstance(body, dict):
@@ -589,6 +599,15 @@ def handle_create_workstream_route(ctx):
     if kind != "interactive":
         raise bad_request("kind must be 'interactive' through the routing proxy", kind=kind)
 
+    explicit_id = body.get("ws_id")
+    if explicit_id is not None:
+        explicit_id = str(explicit_id)
+        # A malformed id is 400 "invalid ws_id" on the real server, not 409.
+        if not re.match(r"^[A-Za-z0-9._:-]{1,64}$", explicit_id):
+            raise bad_request("invalid ws_id", ws_id=explicit_id)
+        if state.STORE.exists(explicit_id):
+            raise conflict("Workstream already exists", ws_id=explicit_id)
+
     initial = _optional_str(body, "initial_message")
     record = state.STORE.create_workstream(
         kind="interactive",
@@ -600,6 +619,7 @@ def handle_create_workstream_route(ctx):
         tokens=_initial_tokens(initial, ctx.config.reply),
         meta=_creation_meta(body, ("client_type", "judge_model", "auto_approve",
                                    "auto_approve_tools")),
+        ws_id=explicit_id,
     )
     return 201, _creation_response(record, surface="route")
 

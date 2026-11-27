@@ -243,6 +243,35 @@ shows an error and the transcript stays exactly as it was. The header and the
 transcript are applied together in one savepoint, so a failure part-way cannot
 leave half a transcript.
 
+**One writer per session, and a send that survives a re-run.** Odoo rolls the
+transaction back and re-runs a whole JSON-RPC handler up to **five times** on a
+`SerializationFailure` (`service.model.retrying()`). A handler that has already
+POSTed to Turnstone therefore delivers the user's message again on every retry —
+observed once as one logical send reaching the agent five times. Two rules
+answer it:
+
+- **Nothing after the POST may raise a retryable conflict.** The local half of a
+  send — the `thinking` flag, the audit row, the synced mirror — runs inside
+  `_no_replay`, which drops a write that loses a race instead of raising. What
+  it loses is bookkeeping the next poll recomputes anyway; what it keeps is the
+  message that is already at the server. `retry`, `approve` and `rewind` get the
+  same treatment, because each is a remote side effect a re-run would apply
+  twice.
+- **A create is idempotent, not merely loud.** An interactive create presents a
+  `ws_id` derived from the session's own row id (`_client_ws_id()` — derived on
+  purpose: a stored id would be rolled back with the transaction it exists to
+  identify), and Turnstone answers a repeat with HTTP 409
+  "Workstream already exists", which is adopted rather than turned into a second
+  workstream. The console create has no id field, so coordinator sessions rely
+  on the local-half rule instead.
+
+A row lock is **not** what makes the mirror safe, and this was measured rather
+than assumed: at REPEATABLE READ a waiter's snapshot is pinned when it starts, so
+once the holder commits the waiter's own write raises anyway, whether the lock was
+`SELECT … FOR UPDATE` or `pg_advisory_xact_lock`. `sync_from_server` therefore
+takes a **non-blocking** `pg_try_advisory_xact_lock` and a poll that cannot win
+writes nothing, rather than queueing up to fail.
+
 **The chat reopens the last session, and remembers it per user.** Every session
 of one configured agent is filed under exactly that agent's name
 (`session_new_from_agent`), so a fresh Agent Chat used to open on a screen with

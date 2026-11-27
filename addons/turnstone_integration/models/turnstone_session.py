@@ -12,17 +12,42 @@ import json
 import logging
 import mimetypes
 import re
+import uuid
+from contextlib import contextmanager
+
+from psycopg2 import errors as pg_errors
 
 from odoo import _, api, fields, models
-from odoo.exceptions import AccessError, UserError
+from odoo.exceptions import AccessError, ConcurrencyError, UserError
 
 from .turnstone_client import (
     SESSION_DETAIL_MESSAGE_LIMIT,
+    TurnstoneConflict,
     TurnstoneError,
     TurnstoneNotFound,
 )
 
 _logger = logging.getLogger(__name__)
+
+# Odoo's HTTP layer wraps every JSON-RPC handler in `service.model.retrying()`,
+# which catches these and RE-RUNS THE WHOLE HANDLER BODY up to
+# MAX_TRIES_ON_CONCURRENCY_FAILURE (5) times (`odoo/service/model.py:30`, used
+# by `odoo/http.py`). For a handler that has already POSTed to Turnstone that
+# is a duplicate delivery: one logical send reached the agent five times
+# (OTI-5729 §J, observed). Anything in a send/creates path that can raise one
+# of these is therefore a duplication bug, not a retry.
+RETRYABLE_CONFLICTS = (
+    pg_errors.SerializationFailure,
+    pg_errors.LockNotAvailable,
+    pg_errors.DeadlockDetected,
+    ConcurrencyError,
+)
+
+# Advisory-lock namespace for "one writer per session". Advisory locks are
+# keyed by two int4s here, so the first is this module's own constant and the
+# second is the session id: no other feature of the database can collide with
+# it, and it needs no table to exist.
+SESSION_LOCK_NAMESPACE = 0x54534E53  # "TSNS", well inside int4
 
 # Odoo MCP tools that mean "something changed in Odoo". Mapped to the operation
 # we record so the chat can say "Created knowledge.article 42" rather than
@@ -182,6 +207,52 @@ class TurnstoneSession(models.Model):
 
     # -- lifecycle ---------------------------------------------------------
 
+    def _client_ws_id(self):
+        """The id this session will ask Turnstone to give its workstream.
+
+        This is the whole of the create half of RC-6 (OTI-5729 §J). A create is
+        a remote side effect inside a transaction Odoo may re-run up to five
+        times, so the re-run must be able to say "you already did this" rather
+        than creating a second workstream. Turnstone's routing proxy honours a
+        caller-supplied ``ws_id`` and answers a repeat with HTTP 409
+        "Workstream already exists" (verified on 1.8.3, OTI-5763 Q3), so the id
+        the caller presents IS the idempotency token.
+
+        **Derived, not stored — and that is the point.** The obvious design is a
+        ``uuid4()`` written to the row before the POST, but Odoo's retry runs
+        after a rollback: the uuid would be rolled back *with* the very
+        transaction it exists to identify, so the re-run would generate a fresh
+        one and create the duplicate anyway. A value computed from state that
+        survives a rollback — the row's own identity — is stable across every
+        re-run of the same logical first send, and different for every session,
+        which is exactly what an idempotency key has to be.
+
+        Consequences worth knowing:
+
+        * Two sessions never share an id (the row id is unique), so one cannot
+          adopt another's workstream through a 409.
+        * The id does not change if the session's name or agent is edited
+          between the failed attempt and the retry — which is right: those are
+          the same logical create.
+        * It is a UUID rather than Turnstone's own format, because ``ws_id`` is
+          documented as a 32-hex value and the real server validates the shape
+          (a malformed one is 400 "invalid ws_id").
+        * A **coordinator** create cannot be keyed this way: the console
+          endpoint has no ``ws_id`` field at all. There the local half of the
+          request is what must not raise (``_no_replay``), which stops a
+          re-run from delivering the message twice. A residual window stays
+          open and is not closable from here: if the transaction dies after a
+          coordinator create succeeded but before its own ``ws_id`` write
+          committed, the retry makes a second coordinator. Fixing that needs
+          an id field on the console create; interactive sessions -- the
+          default kind -- are fully covered.
+        """
+        self.ensure_one()
+        return str(uuid.uuid5(
+            uuid.UUID("6f1b0c1e-6d5a-5a1e-9b0f-8a0f8a1d0e27"),
+            "turnstone.session/%d" % self.id,
+        ))
+
     def _ensure_started(self, first_message=None):
         """Create the workstream on Turnstone if this session has none yet.
 
@@ -204,6 +275,15 @@ class TurnstoneSession(models.Model):
         which is the same reading ``_fetch_detail`` applies to a detail response
         (OTI-5744): the console says an error when it means one, and a
         half-built workstream it flagged is not one to start writing into.
+
+        **Idempotent on the interactive surface (OTI-5767).** This call is a
+        remote side effect inside a transaction Odoo may re-run up to five
+        times, so it is made safe to repeat rather than merely made loud: an
+        interactive create presents ``_client_ws_id()``, and a 409 for it means
+        the earlier run of this same transaction already made the workstream, so
+        the id is adopted instead of a second one being created. A coordinator
+        create cannot be keyed that way (the console endpoint has no id field),
+        so there the guarantee comes from the local half — see ``_no_replay``.
         """
         self.ensure_one()
         if self.ws_id:
@@ -211,17 +291,40 @@ class TurnstoneSession(models.Model):
         conn = self.connection_id
         conn._check_user_allowed(self.user_id)
         agent = self.agent_id.sudo()
-        result = conn._client().create_session(
-            name=self.name,
-            skill=self.skill or agent.skill or conn.sudo().default_skill or None,
-            persona=self.persona or agent.persona or conn.sudo().default_persona or None,
-            model=self.model_alias or agent.model_alias or conn.sudo().default_model or None,
-            initial_message=first_message,
-            kind=self.kind or "interactive",
-            judge_model=agent.judge_model or None,
-            auto_approve=agent.auto_approve or None,
-            auto_approve_tools=agent.auto_approve_tool_list() if agent else None,
-        )
+        kind = self.kind or "interactive"
+        # Only the routing proxy takes an id; asking the console endpoint to
+        # honour one would be a lie (see `TurnstoneClient.create_session`).
+        requested_ws_id = self._client_ws_id() if kind == "interactive" else None
+        try:
+            result = conn._client().create_session(
+                name=self.name,
+                skill=self.skill or agent.skill or conn.sudo().default_skill or None,
+                persona=self.persona or agent.persona or conn.sudo().default_persona or None,
+                model=self.model_alias or agent.model_alias or conn.sudo().default_model or None,
+                initial_message=first_message,
+                kind=kind,
+                judge_model=agent.judge_model or None,
+                auto_approve=agent.auto_approve or None,
+                auto_approve_tools=agent.auto_approve_tool_list() if agent else None,
+                ws_id=requested_ws_id,
+            )
+        except TurnstoneConflict:
+            # 409 on a create that presented its own id means the workstream
+            # this request asked for EXISTS — created by an earlier run of this
+            # same transaction, which then rolled back. That is success, not a
+            # failure: adopt the id and carry on, so the retry delivers the
+            # message to the workstream that is already there instead of making
+            # a second one. There is deliberately no second create attempt: if
+            # the id is taken by something else, adopting it is still the only
+            # answer that does not duplicate — the next sync tells the truth
+            # about whether it is ours.
+            if not requested_ws_id:
+                raise
+            _logger.info(
+                "Turnstone already had workstream %s for session %s; adopting it "
+                "rather than creating a second", requested_ws_id, self.id,
+            )
+            result = {"ws_id": requested_ws_id}
         ws_id = result.get("ws_id") if isinstance(result, dict) else None
         if not ws_id or result.get("error"):
             # Nothing is written here, deliberately. The session's own state,
@@ -275,6 +378,89 @@ class TurnstoneSession(models.Model):
             rendered = repr(result)
         return rendered[:limit] + ("…" if len(rendered) > limit else "")
 
+    @contextmanager
+    def _no_replay(self, what):
+        """Run local bookkeeping that must never be able to trigger a re-run.
+
+        Odoo re-runs a whole JSON-RPC handler when a write raises a retryable
+        conflict, and `action_send` has already POSTed to Turnstone by the
+        time it writes the local half. A raise here is therefore a duplicate
+        delivery (OTI-5729 §J: one logical send reached the agent five times).
+
+        So the local half loses races quietly. What is protected is
+        bookkeeping that a later poll recomputes anyway — the mirrored
+        transcript, the header, the "working" flag. The remote side effect
+        has already happened and cannot be undone, so the honest outcome is:
+        keep it, drop the local write that lost, and let the next
+        `sync_from_server` put the mirror where the server says it is.
+
+        **Measured, not assumed:** a `SerializationFailure` caught at an Odoo
+        `cr.savepoint()` leaves the transaction usable and still committable
+        (isolated stack, REPEATABLE READ as `odoo/sql_db.py:373` sets it), so
+        the rest of the request survives with the remote POST intact.
+
+        It is a context manager whose body runs in a savepoint, so callers do
+        not need a second `cr.savepoint()` — nesting two would work but makes
+        the rollback boundary unclear to read.
+        """
+        self.ensure_one()
+        try:
+            with self.env.cr.savepoint():
+                yield
+        except RETRYABLE_CONFLICTS as exc:
+            _logger.info(
+                "Session %s lost a write race while %s (%s); the local write was "
+                "dropped rather than raising, so the request is not replayed and "
+                "the next sync reconciles it. Any remote call has already happened.",
+                self.id, what, exc,
+            )
+
+    def _send_once(self, body):
+        """Deliver one message to Turnstone and mirror it, at most once.
+
+        Two halves, deliberately separated:
+
+        1. **The remote half** — create-or-send. Exactly one call, and the call
+           is what may be retried only by being idempotent (the create: see
+           `_client_ws_id`) rather than by being re-executed.
+        2. **The local half** — the "working" flag, the audit row, the synced
+           mirror. None of it may raise a retryable conflict, because by then
+           the message is already delivered (`_no_replay`).
+
+        `action_retry` is NOT a delivery retry — it asks the model for a fresh
+        answer to the turn already sent. Nothing here has anything to do with
+        it.
+        """
+        self.ensure_one()
+        if not self.ws_id:
+            self._ensure_started(first_message=body)
+        else:
+            self.connection_id._client().send(self.ws_id, body, kind=self.kind)
+
+        # Only a session that HAS a workstream can be working. This is a
+        # backstop, not the primary check: _ensure_started raises rather than
+        # returning without an id, so by here the id exists or we never got
+        # here. It stays because the invariant is the whole point of the
+        # create-side fix — `thinking` written over a session with nothing
+        # behind it is the ghost that used to swallow the first message — and
+        # one field read is cheap insurance against a future caller
+        # reintroducing it.
+        if not self.ws_id:
+            raise TurnstoneError(_(
+                "This session has no Turnstone workstream, so the message was not "
+                "sent. Nothing was recorded as working.",
+            ))
+        # The message is delivered from here on. Nothing below may raise a
+        # retryable conflict: see `_no_replay`.
+        with self._no_replay("recording a send"):
+            self.sudo().write({
+                "state": "thinking", "last_activity": fields.Datetime.now(),
+            })
+            self.env["turnstone.audit.log"].log(
+                "message_send", session=self, detail=body[:500],
+            )
+        return self.sync_from_server()
+
     def action_send(self, body):
         """Send a user message and mirror it immediately.
 
@@ -288,29 +474,7 @@ class TurnstoneSession(models.Model):
             raise UserError(_("Nothing to send."))
         if self.state == "closed":
             raise UserError(_("This session is closed. Start a new one."))
-
-        if not self.ws_id:
-            self._ensure_started(first_message=body)
-        else:
-            self.connection_id._client().send(self.ws_id, body, kind=self.kind)
-
-        # Only a session that HAS a workstream can be working. This is a
-        # backstop, not the primary check: _ensure_started raises rather than
-        # returning without an id, so by here the id exists or we never got
-        # here. It stays because the invariant is the whole point of this fix —
-        # `thinking` written over a session with nothing behind it is the ghost
-        # that used to swallow the first message — and one field read is cheap
-        # insurance against a future caller reintroducing it.
-        if not self.ws_id:
-            raise TurnstoneError(_(
-                "This session has no Turnstone workstream, so the message was not "
-                "sent. Nothing was recorded as working.",
-            ))
-        self.sudo().write({"state": "thinking", "last_activity": fields.Datetime.now()})
-        self.env["turnstone.audit.log"].log(
-            "message_send", session=self, detail=body[:500],
-        )
-        return self.sync_from_server()
+        return self._send_once(body)
 
     def action_approve(self, approved, feedback=None):
         """Resolve a pending tool approval."""
@@ -336,11 +500,15 @@ class TurnstoneSession(models.Model):
             # log a second decision for one approval, and do not claim the
             # agent is working — just show whatever is actually true now.
             return self.sync_from_server()
-        self.sudo().write({"state": "thinking", "pending_approval_json": "[]"})
-        self.env["turnstone.audit.log"].log(
-            "tool_approve" if approved else "tool_deny",
-            session=self, tool=tool_name, detail=feedback or None,
-        )
+        # The decision is recorded remotely from here on: the local half loses
+        # races quietly rather than raising (`_no_replay`), because a raise is
+        # what makes Odoo re-run the handler and deliver it again.
+        with self._no_replay("recording an approval"):
+            self.sudo().write({"state": "thinking", "pending_approval_json": "[]"})
+            self.env["turnstone.audit.log"].log(
+                "tool_approve" if approved else "tool_deny",
+                session=self, tool=tool_name, detail=feedback or None,
+            )
         return self.sync_from_server()
 
     def action_retry(self):
@@ -350,8 +518,12 @@ class TurnstoneSession(models.Model):
         if not self.ws_id:
             raise UserError(_("This session has not started."))
         self.connection_id._client().retry(self.ws_id, kind=self.kind)
-        self.env["turnstone.audit.log"].log("session_retry", session=self)
-        self.sudo().write({"state": "thinking"})
+        # A retry IS a remote side effect (it asks the model again), so a
+        # re-run of this handler would re-ask it. Local bookkeeping therefore
+        # cannot raise a conflict, exactly as in `_send_once`.
+        with self._no_replay("recording a retry"):
+            self.env["turnstone.audit.log"].log("session_retry", session=self)
+            self.sudo().write({"state": "thinking"})
         return self.sync_from_server()
 
     def action_rewind(self, turns=1):
@@ -361,9 +533,12 @@ class TurnstoneSession(models.Model):
         if not self.ws_id:
             raise UserError(_("This session has not started."))
         self.connection_id._client().rewind(self.ws_id, turns=turns, kind=self.kind)
-        self.env["turnstone.audit.log"].log(
-            "session_rewind", session=self, detail=_("%s turn(s)") % turns,
-        )
+        # Dropping turns is a remote side effect; re-running this handler would
+        # drop them twice. See `action_retry`.
+        with self._no_replay("recording a rewind"):
+            self.env["turnstone.audit.log"].log(
+                "session_rewind", session=self, detail=_("%s turn(s)") % turns,
+            )
         # Authoritative: dropping turns is this call's whole purpose, so a
         # shorter transcript here is the truth rather than a partial response.
         # Without it a rewind back to nothing would be refused as "no history".
@@ -448,11 +623,79 @@ class TurnstoneSession(models.Model):
             )
             messages = None
 
-        # The transcript and the header it describes go in as ONE unit: a
-        # response that is refused must not have already rewritten the state,
-        # counters and last-activity of a session it did not describe. The
-        # savepoint makes that true even if the write itself fails part-way.
-        with self.env.cr.savepoint():
+        applied = self._apply_detail(
+            vals, messages, authoritative=authoritative,
+        )
+        if not applied:
+            # Another transaction holds this session's write lock and is
+            # applying its own (equally valid) response. Ours is dropped
+            # WITHOUT touching the database: it would be a second writer for
+            # the same rows, which is a serialisation failure by construction
+            # (measured: two concurrent syncs raised every round). Reporting
+            # the mirror as it stands is honest — the holder's own response
+            # is a newer or identical view of the same server.
+            _logger.info(
+                "Session %s: another transaction is applying a sync response; "
+                "this one was dropped rather than contending for the mirror.",
+                self.id,
+            )
+        return self._as_dict()
+
+    def _session_write_lock(self):
+        """Try to become the one writer of this session's mirror. Non-blocking.
+
+        `pg_try_advisory_xact_lock` so a poll that cannot win gives up
+        immediately rather than queueing: two pollers must not both write the
+        transcript, and the loser has nothing to do anyway because the winner
+        is writing the same server state.
+
+        **Why a try-lock and not `SELECT … FOR UPDATE`.** The investigation's
+        Fix 6(a) proposed a row lock. Measured on a real Postgres at REPEATABLE
+        READ (Odoo's level, `sql_db.py:373`), a lock does not serialise two
+        writers *within* a handler that may already have read: the waiter's
+        snapshot is pinned at its first statement, so once the holder commits
+        the waiter's own UPDATE still raises `SerializationFailure`. A blocking
+        lock therefore turns "two writers conflict" into "two writers conflict
+        a little later", while a try-lock turns it into "one writer, one
+        no-op". Only the second one stops `service.model.retrying()` from
+        re-running anything.
+
+        The lock is transaction-scoped (`_xact_`), so it is released when the
+        request commits or rolls back, and it cannot leak if a caller forgets
+        to give it back. A transaction takes it once per session per
+        transaction; taking it twice in one transaction succeeds both times,
+        which keeps nested callers (a send calling sync) working.
+        """
+        self.ensure_one()
+        self.env.cr.execute(
+            "SELECT pg_try_advisory_xact_lock(%s, %s)",
+            (SESSION_LOCK_NAMESPACE, self.id),
+        )
+        return bool(self.env.cr.fetchone()[0])
+
+    def _apply_detail(self, vals, messages, authoritative=False):
+        """Write one detail response's header, transcript and derived rows.
+
+        Returns False when another transaction owns this session's mirror right
+        now — the caller then keeps whatever it has rather than competing.
+
+        Everything a sync writes for a session lives here, behind one lock and
+        one savepoint: the header, the transcript, the linked records and the
+        subagent rows. They are all claims about the same response, so they
+        must land together or not at all, and they must all be written by the
+        one transaction that holds the session's lock. A response that is
+        refused must not have already rewritten the state, counters and
+        last-activity of a session it did not describe.
+
+        `_no_replay` is what makes the whole thing safe under contention: a
+        racing write is dropped, not raised, so `service.model.retrying()` has
+        nothing to re-run and a request that had already POSTed to Turnstone is
+        never replayed.
+        """
+        self.ensure_one()
+        if not self._session_write_lock():
+            return False
+        with self._no_replay("storing a sync response"):
             if messages is not None:
                 vals["sync_note"] = self.env["turnstone.message"]._replace_transcript(
                     self, messages, authoritative=authoritative,
@@ -464,10 +707,9 @@ class TurnstoneSession(models.Model):
                     fetch_limit=SESSION_DETAIL_MESSAGE_LIMIT,
                 ) or False
             self.sudo().write(vals)
-
-        self._sync_linked_records(messages or [])
-        self._sync_subagents()
-        return self._as_dict()
+            self._sync_linked_records(messages or [])
+            self._sync_subagents()
+        return True
 
     # -- sync internals ----------------------------------------------------
 
