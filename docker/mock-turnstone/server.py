@@ -45,6 +45,7 @@ called out in README.md rather than silently missing, so a later test that needs
 it knows to ask instead of debugging a mysterious 404.
 """
 
+import copy
 import hmac
 import json
 import logging
@@ -704,13 +705,25 @@ def handle_session_detail(ctx):
       tool_calls, context_ratio, activity, activity_state, title, and
       `pending_approval_details` (a non-empty list is what the addon maps to
       `attention`).
-    * `messages` — the transcript. Present and empty rather than missing when
-      there are no turns: `detail.get("messages") or []` cannot tell "absent"
-      from "empty", and a missing key is how a real sync wipes a good mirror.
-      OTI-5736 owns the transcript's message shapes; this returns whatever
-      seeding (or a create's `initial_message`) put there.
+    * `messages` — the transcript, as `_history_payload` shapes it: a list,
+      present and empty rather than missing when there are no turns
+      (`detail.get("messages") or []` cannot tell "absent" from "empty", and a
+      missing key is how a real sync wipes a good mirror). Each row carries
+      `role`, `content`, `timestamp` and, when present, `tool_calls` /
+      `tool_call_id` — see `state.normalise_message`, which is the one place
+      that shape is decided.
+
+    `message_limit` is the real endpoint's parameter for a bounded tail. It is
+    applied only when the caller sends it; the default is the whole transcript,
+    because the real default of 20 would silently truncate the very fixtures this
+    mock exists to serve. OTI-5740 owns reproducing the bounded-tail default as a
+    failure mode.
     """
     record = ctx.resolve_session()
+    limit = ctx.int_arg("message_limit", None)
+    if limit is not None and limit < 1:
+        raise bad_request("message_limit must be 1 or greater", message_limit=limit)
+    history = _history_payload(record, limit=min(limit, 200) if limit else None)
     return 200, {
         "persisted": {
             "ws_id": record["id"],
@@ -743,8 +756,101 @@ def handle_session_detail(ctx):
             "pending_approval_details": record["pending_approval_details"],
             "node_id": record["node_id"],
         },
-        "messages": record["messages"],
+        "messages": history["messages"],
+        "message_limit": limit,
     }
+
+
+def _history_payload(record, limit=None, max_limit=500):
+    """The body `GET .../history` answers, and the one detail's tail uses.
+
+    `ws_id` and `messages` are the required shape (1.8.3 `WorkstreamHistoryResponse`
+    requires `ws_id`, carries `messages`). `cursor` and `handoff_token` are part of
+    that documented response but are meaningless here: they belong to the
+    REST-to-SSE handoff, and the mock has no event stream, so they are `null`
+    exactly as a real read with nothing in flight returns. Present-and-null rather
+    than absent, so a test asserting on the shape sees the same keys it would get
+    from a server.
+
+    `limit` bounds the tail to the most recent N rows, as the real `limit` query
+    parameter does. Only applied when the caller asked: the default is the whole
+    transcript, because "seed 25 messages, read them back" is what the harness is
+    for, and a silent 20-row tail here would look like a transcript bug. The real
+    server's default of 20 is a failure mode in its own right and OTI-5740 owns
+    reproducing it.
+    """
+    messages = record.get("messages") or []
+    if limit is not None:
+        messages = messages[-limit:] if limit > 0 else []
+    return {
+        "ws_id": record["id"],
+        "messages": copy.deepcopy(messages),
+        "cursor": None,
+        "handoff_token": None,
+    }
+
+
+def handle_session_history(ctx):
+    """GET .../workstreams/{ws_id}/history — the transcript, oldest first.
+
+    The same rows `detail` carries under `messages`, for the sessions its own
+    surface hosts: a coordinator on the console path, an interactive session on
+    the route path. Both handlers read the same store, so the two surfaces cannot
+    disagree about a conversation, and the surface pairing is still decided in
+    `resolve_session` — this handler never re-checks a kind.
+
+    `limit` is the real query parameter's name and meaning (max conversation rows
+    from the tail, 500 max); see `_history_payload` for why the default here is
+    the whole transcript rather than the real server's 100.
+
+    Divergence from the real server worth knowing: 1.8.3's published spec declares
+    history on the console path only, with no `/route/` twin, while this mock
+    declares both (the route entry exists so an interactive session's history is
+    readable at all — the console path refuses it, `resolve_session`). OTI-5763 is
+    confirming the real surface list; if it turns out interactive history is only
+    served through cluster detail, the route twin should be withdrawn rather than
+    kept for symmetry.
+    """
+    record = ctx.resolve_session()
+    limit = ctx.int_arg("limit", None)
+    if limit is not None and limit < 1:
+        raise bad_request("limit must be 1 or greater", limit=limit)
+    return 200, _history_payload(record, limit=min(limit, 500) if limit else None)
+
+
+def handle_session_rewind(ctx):
+    """POST .../workstreams/{ws_id}/rewind — drop the last N turns.
+
+    The real endpoint takes `{"turns": N}` (required, minimum 1) and answers a
+    generic `{"status": "ok"}`. `turns` counts user turns — a prompt and the
+    replies answering it — not rows, and it is clamped to what the session has
+    (RewindRequest: "Clamped to the available turn count"), so dropping five
+    turns from a two-turn conversation empties it instead of failing.
+
+    This exists in the harness because a rewind is the one thing that makes a
+    transcript SHORTER, and a mirror that only ever grows cannot be shown to
+    follow the server. OTI-5744's guards are written against exactly this
+    (a shorter list that is not a prefix of ours is a rewind, not a partial
+    view), so a test needs to be able to cause it on demand.
+
+    The status body also carries `dropped`/`remaining`, which the real server
+    does not send. That is deliberate: an assertion can then say "three rows
+    went and one turn stayed" without a second read, and the extra keys are
+    additive on a response nothing parses strictly.
+    """
+    record = ctx.resolve_session()
+    body = ctx.json_body()
+    if not isinstance(body, dict):
+        raise bad_request("rewind body must be a JSON object")
+    turns = body.get("turns")
+    if turns is None:
+        raise bad_request("turns is required", detail="{\"turns\": N} drops the last N user turns")
+    if isinstance(turns, bool) or not isinstance(turns, int):
+        raise bad_request("turns must be an integer", turns=turns)
+    if turns < 1:
+        raise bad_request("turns must be 1 or greater", turns=turns)
+    result = ctx.store.rewind(record["id"], turns)
+    return 200, dict(result, status="ok", ws_id=record["id"])
 
 
 # ---------------------------------------------------------------------------
@@ -779,17 +885,41 @@ def handle_mock_seed(ctx):
     Body (all optional but kind):
         kind, name, title, state, skill, persona, model_alias, parent_ws_id,
         ws_id, tokens, tool_calls, context_ratio, activity, activity_state,
-        messages, pending_approval_details, meta
+        messages, pending_approval_details, meta, append
+
+    `messages` are normalised by `state.normalise_message`, so a test can seed
+    the loose shape (a bare `{\"name\": ..., \"arguments\": {...}}` tool call,
+    content parts, a `text` key) and read back the one spelling the addon parses.
+    The response is the stored record, so an assertion reads what will be served
+    rather than what was sent.
+
+    `append: true` plants `messages` onto an EXISTING workstream instead of
+    creating one (then `kind` is ignored and a pinned `ws_id` is the target):
+    "seed a transcript before opening chat" on a session that
+    `POST /workstreams/new` already made. The in-process equivalent is
+    `state.STORE.plant_transcript(ws_id, messages)`; this is the same helper for
+    a test in another container, which cannot import state.py.
     """
     body = ctx.json_body()
     if not isinstance(body, dict):
         raise bad_request("seed body must be a JSON object")
-    kind = body.get("kind") or "interactive"
-    if kind not in ("coordinator", "interactive"):
-        raise bad_request("kind must be 'coordinator' or 'interactive'")
     messages = body.get("messages") or []
     if not isinstance(messages, list):
         raise bad_request("messages must be a list")
+
+    if body.get("append"):
+        target = body.get("ws_id")
+        if not target:
+            raise bad_request("append needs the ws_id to plant the transcript on")
+        try:
+            rows = state.STORE.plant_transcript(str(target), messages, replace=False)
+        except KeyError as exc:
+            raise not_found("workstream not found", ws_id=str(target)) from exc
+        return 200, dict(state.STORE.get(str(target)), messages=rows)
+
+    kind = body.get("kind") or "interactive"
+    if kind not in ("coordinator", "interactive"):
+        raise bad_request("kind must be 'coordinator' or 'interactive'")
 
     explicit_id = body.get("ws_id")
     if explicit_id is not None:
@@ -927,14 +1057,15 @@ ROUTES = [
           note="the one surface returning persisted + live + messages for any node"),
 
     # -- transcript --------------------------------------------------------
-    Route("GET", "/v1/api/workstreams/{ws_id}/history",
-          reserved("OTI-5736", "console session history"),
-          surface="console", session=True,
-          note="console-only: an interactive session's history lives on its node"),
-    Route("GET", "/v1/api/route/workstreams/{ws_id}/history",
-          reserved("OTI-5736", "routed session history"),
-          surface="route", session=True,
-          note="declared for symmetry; the client reads history via cluster detail"),
+    # Both surfaces, because a session of either kind has a transcript and the
+    # only place the pairing is decided is `resolve_session` — duplicating it in
+    # the handler is how a mock starts accepting an API Turnstone rejects.
+    # (1.8.3's published spec lists the console path only; see
+    # `handle_session_history` for why the twin is declared and what would
+    # retire it.)
+    *both_surfaces("GET", "/v1/api/workstreams/{ws_id}/history",
+                   handle_session_history,
+                   note="the transcript detail also carries, with the real `limit` query"),
 
     # -- per-session control, on both surfaces ------------------------------
     *both_surfaces("POST", "/v1/api/workstreams/{ws_id}/send",
@@ -951,8 +1082,9 @@ ROUTES = [
     *both_surfaces("POST", "/v1/api/workstreams/{ws_id}/retry",
                    reserved("", "retry the last turn"), owner=""),
     *both_surfaces("POST", "/v1/api/workstreams/{ws_id}/rewind",
-                   reserved("OTI-5736", "drop the last N turns"), owner="OTI-5736",
-                   note="needed to prove the mirror follows a server-side rewind"),
+                   handle_session_rewind,
+                   note="turns=N drops the last N user turns; the only way a "
+                        "transcript gets shorter, which OTI-5744's guards need"),
     *both_surfaces("POST", "/v1/api/workstreams/{ws_id}/close",
                    reserved("", "close the workstream"), owner="",
                    note="needed by reopen/close tests; no ticket claims it yet"),
