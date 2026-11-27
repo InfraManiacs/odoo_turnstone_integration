@@ -144,5 +144,48 @@
             <field name="domain_force">[('company_id', 'in', company_ids)]</field>
         </record>
 
+        <!--
+            Automations are configuration, and configuration is company
+            property: "new helpdesk ticket" in one company is a different rule,
+            with a different agent, from the same words in another. The rule is
+            global (no `groups`) rather than manager-only on purpose — a
+            manager is not exempt from it, because a manager who could see
+            another company's rules could read that company's prompt templates
+            and point them at its agents. Managers still see every rule of
+            every company they are allowed to work in, since `company_ids` is
+            the user's whole allowed set, not just the selected company.
+
+            The model is manager-only at the ACL level (`ir.model.access.csv`):
+            an ordinary user has no read on a rule at all. That is deliberate —
+            a rule names an agent and a prompt, and reading it is reading the
+            configured authority of the automation.
+        -->
+        <record id="rule_automation_company" model="ir.rule">
+            <field name="name">Turnstone: automations per company</field>
+            <field name="model_id" ref="model_turnstone_automation"/>
+            <field name="domain_force">[('company_id', 'in', company_ids)]</field>
+        </record>
+
+        <!--
+            A run inherits its rule's company (`company_id` is a stored related
+            field on the model), so this one rule is what makes "automation
+            rows are never visible across companies" true for the run history
+            too — including for a manager, since the rule is global.
+
+            This is the only rule a run needs, because it is the one the
+            requirement is about. Ordinary users hold a read-only ACL on runs,
+            so "read runs of automations they are allowed to see and nothing
+            else" is exactly: the runs of the automations in their companies,
+            with no way to create, change or delete one. Writing a run (a state
+            transition, a recorded error) is the launch service's job, and it
+            does so under `sudo()` — the model's own `write()` is the choke
+            point that keeps the state graph honest, and no user needs the bit.
+        -->
+        <record id="rule_automation_run_company" model="ir.rule">
+            <field name="name">Turnstone: automation runs per company</field>
+            <field name="model_id" ref="model_turnstone_automation_run"/>
+            <field name="domain_force">[('company_id', 'in', company_ids)]</field>
+        </record>
+
     </data>
 </odoo>
