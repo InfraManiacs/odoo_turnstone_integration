@@ -11,6 +11,7 @@ Turnstone.
 """
 
 import logging
+from datetime import datetime
 
 from odoo import _, http
 from odoo.exceptions import AccessError, UserError
@@ -104,17 +105,47 @@ class TurnstoneController(http.Controller):
     def _session_list(self, include_id=None):
         """Sessions for the sidebar.
 
-        `include_id` is never optional in practice: a subagent is usually
-        CLOSED by the time you open it — a coordinator calls close_all_children
-        when it is done — so a plain "state != closed" list drops the very
-        session the user is looking at, stranding them on a conversation that
-        appears nowhere.
+        Two things this list has to get right, because it is the only way a
+        user gets back to a chat they left:
+
+        * A session they walked away from is still listed. Closed sessions are
+          included rather than filtered out: `action_close` keeps the row and
+          its transcript (only the remote workstream is closed), so hiding it
+          makes a chat that still exists look deleted. They come after the open
+          ones and are capped, so history cannot crowd out live work. The row
+          carries its state, so the client can show it as closed.
+        * `include_id` is never optional in practice: a subagent is usually
+          CLOSED by the time you open it — a coordinator calls close_all_children
+          when it is done — so it must stay listed while the user is standing on
+          it. It is accepted as an int, a numeric string, or a list of either
+          (the client may send one or several), and anything unusable is
+          ignored rather than raising: a malformed hint must not cost the user
+          their whole sidebar.
+
+        Access is the record rules' decision, not this method's: the search
+        below runs as the caller, so a user sees their own sessions and a
+        manager sees all — never another user's, and never another company's
+        (the connection rule scopes the servers).
         """
         Session = request.env["turnstone.session"]
-        domain = [("state", "!=", "closed")]
-        if include_id:
-            domain = ["|", ("id", "=", int(include_id))] + domain
-        sessions = Session.search(domain, limit=60)
+        # Two tiers, because one window over everything lets a long history of
+        # closed chats push a live one out of the sidebar. Open sessions keep
+        # the original 60-row budget; closed ones are appended after them,
+        # bounded, so a chat the user closed stays reachable without ever
+        # displacing work in progress.
+        sessions = Session.search([("state", "!=", "closed")], limit=60)
+        closed = Session.search(
+            [("state", "=", "closed"), ("id", "not in", sessions.ids)], limit=20,
+        )
+        sessions |= closed
+        # The session being opened may be older than either window (a long
+        # sidebar), so fetch it explicitly rather than dropping the user onto a
+        # conversation that appears nowhere. Through search(), not browse(): the
+        # record rules still decide whether it comes back.
+        keep = self._as_ids(include_id)
+        missing = [i for i in keep if i not in sessions.ids]
+        if missing:
+            sessions |= Session.search([("id", "in", missing)])
 
         # Pull in subagents of everything listed, whatever their state. A
         # coordinator closes its children when it is done, so filtering them out
@@ -127,22 +158,26 @@ class TurnstoneController(http.Controller):
                 ("id", "not in", sessions.ids),
             ], limit=60)
             sessions |= children
-        return [
-            {
-                "id": s.id,
-                "name": s.name,
-                "state": s.state,
-                "skill": s.skill or None,
-                "kind": s.kind,
-                "ws_id": s.ws_id or None,
-                "parent_ws_id": s.parent_ws_id or None,
-                "adopted": s.adopted,
-                "has_pending_approval": s.has_pending_approval,
-                "last_activity": s.last_activity and s.last_activity.isoformat(),
-                "connection_name": s.connection_id.name,
-            }
-            for s in sessions
-        ]
+        # A recordset union does not re-apply `_order`, and the sidebar (and the
+        # "newest session for this agent" fallback) expects newest first.
+        sessions = sessions.sorted(
+            key=lambda s: (s.last_activity or datetime.min, s.id), reverse=True
+        )
+        return sessions._list_payload()
+
+    @staticmethod
+    def _as_ids(value):
+        """Normalise an id hint to a list of ints, dropping anything unusable."""
+        if value in (None, False, ""):
+            return []
+        values = value if isinstance(value, (list, tuple)) else [value]
+        out = []
+        for item in values:
+            try:
+                out.append(int(item))
+            except (TypeError, ValueError):
+                continue
+        return out
 
     @http.route("/turnstone/catalog", type="jsonrpc", auth="user")
     def catalog(self, connection_id):

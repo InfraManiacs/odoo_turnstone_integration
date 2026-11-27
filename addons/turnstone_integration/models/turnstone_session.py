@@ -754,6 +754,59 @@ class TurnstoneSession(models.Model):
             ("connection_id", "=", self.connection_id.id),
         ], limit=1)
 
+    # -- serialisation for the chat sidebar --------------------------------
+
+    def _list_payload(self):
+        """Sidebar rows for every session in `self`, in recordset order.
+
+        The sidebar is how a user finds a chat they walked away from, so a row
+        has to say enough to tell two sessions of the same agent apart: which
+        agent it runs, when it last did anything, and how much conversation it
+        holds. Without the count an empty draft and a chat with a day of work
+        in it render identically (same name, same agent, both "Ready" or "Not
+        started"), which is what made "my history is gone" the expected reading
+        of starting the same agent twice.
+
+        Counts are gathered once for the whole page: a per-row count would turn
+        a 60-row sidebar into 60 queries on every poll. sudo() matches
+        `_as_dict()` — the recordset is already filtered by the session record
+        rules, and this only reads fields of rows the caller may open anyway.
+        """
+        if not self:
+            return []
+        data = self.env["turnstone.message"].sudo()._read_group(
+            [("session_id", "in", self.ids)], ["session_id"], ["__count"]
+        )
+        counts = {session.id: count for session, count in data}
+        return [rec._as_list_item(counts.get(rec.id, 0)) for rec in self]
+
+    def _as_list_item(self, message_count=0):
+        """One sidebar row. Deliberately cheaper than `_as_dict()`: no
+        transcript, no subagents, no linked records."""
+        self.ensure_one()
+        rec = self.sudo()
+        return {
+            "id": rec.id,
+            # `name` is the title: Turnstone's own title once it has one, the
+            # agent's name before that.
+            "name": rec.name,
+            "state": rec.state,
+            "agent_id": rec.agent_id.id or None,
+            "agent_name": rec.agent_id.name or None,
+            "skill": rec.skill or None,
+            "kind": rec.kind,
+            "ws_id": rec.ws_id or None,
+            "parent_ws_id": rec.parent_ws_id or None,
+            "adopted": rec.adopted,
+            "has_pending_approval": rec.has_pending_approval,
+            "last_activity": rec.last_activity and rec.last_activity.isoformat(),
+            # 0 means nothing has been said yet, which is the only reliable way
+            # to tell a draft from a conversation with the same name.
+            "message_count": message_count,
+            "connection_id": rec.connection_id.id or None,
+            "connection_name": rec.connection_id.name,
+        }
+
     def _as_dict(self):
         self.ensure_one()
         rec = self.sudo()
