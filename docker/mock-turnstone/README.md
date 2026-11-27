@@ -110,9 +110,9 @@ exactly as the handler wrote them: a top-level JSON list stays a list, because
 
 ## Implemented paths
 
-Route table as of this ticket: **15 of 37 declared paths do something, the rest
-answer 501 naming their owner** (16 unclaimed, 6 owned by OTI-5736/5738 in
-this story). The live table is always available from the running process:
+Route table as of OTI-5736: **19 of 37 declared paths do something, the rest
+answer 501 naming their owner** (14 unclaimed, 2 owned by OTI-5738 in this
+story). The live table is always available from the running process:
 
 ```sh
 curl -H 'Authorization: Bearer mock-token' http://localhost:8099/v1/api/admin/mock/routes
@@ -131,10 +131,13 @@ curl -H 'Authorization: Bearer mock-token' http://localhost:8099/v1/api/admin/mo
 | POST | `/v1/api/workstreams/new` | **console create, coordinators only.** `name`, `skill`, `persona`, `initial_message`. Returns `ws_id`, `node_id`, `kind`, the rest of the row, and the whole record under `workstream`. There is no `kind` field on this endpoint: send one and you get a coordinator anyway (it is recorded under `meta.kind` so the mistake is visible) |
 | POST | `/v1/api/route/workstreams/new` | **proxy create, interactive only.** Accepts `kind` (default `interactive`), `model`, `judge_model`, `client_type` and the auto-approve fields. Refuses `kind: "coordinator"` with a 400 naming the console path. Same response shape as the console |
 | GET | `/v1/api/cluster/workstreams` | The cluster feed: `workstreams[]`, `total`, `page`, `per_page`. Query: `page`, `per_page`, `state` (exact), `search` (id/name/title, case-insensitive). Rows carry `id` **and** `ws_id`, `parent_ws_id`, `model_alias` **and** `model`, `node` **and** `node_id`, counters — and **no** transcript |
-| GET | `/v1/api/cluster/ws/{ws_id}/detail` | One session of either kind: `persisted` (row: `ws_id`, kind, parent, persona, node, state, title, model), `live` (state, tokens, tool_calls, context_ratio, activity, activity_state, `pending_approval_details`) and `messages` — always present, `[]` when empty |
+| GET | `/v1/api/cluster/ws/{ws_id}/detail` | One session of either kind: `persisted` (row: `ws_id`, kind, parent, persona, node, state, title, model), `live` (state, tokens, tool_calls, context_ratio, activity, activity_state, `pending_approval_details`) and `messages` — always present, `[]` when empty. `message_limit` bounds the tail when you ask for one |
+| GET | `/v1/api/workstreams/{ws_id}/history` | **A coordinator's transcript**, oldest first: `ws_id`, `messages`, and `cursor`/`handoff_token` (both `null`; they belong to the SSE handoff this mock has none of). `limit` bounds the tail (max 500) |
+| GET | `/v1/api/route/workstreams/{ws_id}/history` | The same transcript for an **interactive** session, through its own surface. Identical body |
+| POST | `/v1/api/workstreams/{ws_id}/rewind` (+ `/route/` twin) | Drop the last N **user turns** and everything answering them: `{"turns": N}`, clamped to what the session has. Answers `{"status":"ok","dropped":…,"remaining":…}` |
 | POST | `/v1/api/admin/mock/reset` | **mock only.** Back to the post-startup shape: no workstreams, ids restart at `ws-000001`, catalogue re-seeded, request log cleared |
 | GET | `/v1/api/admin/mock/state` | **mock only.** Full state snapshot for assertions |
-| POST | `/v1/api/admin/mock/seed` | **mock only.** Create a workstream directly, with any state, transcript, counters and a pinned `ws_id` |
+| POST | `/v1/api/admin/mock/seed` | **mock only.** Create a workstream directly, with any state, transcript, counters and a pinned `ws_id`. `append: true` instead plants `messages` onto an existing `ws_id` |
 | GET | `/v1/api/admin/mock/requests` | **mock only.** The request log: method, path, query, status, ms, truncated body |
 | GET | `/v1/api/admin/mock/routes` | **mock only.** The route table above, live from the running process, with `implemented` and `owner` per entry |
 
@@ -145,9 +148,6 @@ reshaping URLs. The `owner` in the 501 body is the ticket.
 
 | Method | Path | Owner |
 |---|---|---|
-| GET | `/v1/api/workstreams/{ws_id}/history` | OTI-5736 — console history |
-| GET | `/v1/api/route/workstreams/{ws_id}/history` | OTI-5736 — declared for symmetry; the client reads history via cluster detail |
-| POST | `/v1/api/workstreams/{ws_id}/rewind` and its `/route/` twin | OTI-5736 — needed to prove the mirror follows a server-side rewind |
 | POST | `/v1/api/workstreams/{ws_id}/send` and its `/route/` twin | OTI-5738 — prompt post and canned reply |
 | GET | `/v1/api/admin/schedules` | unclaimed — Schedules screen, no ticket yet |
 | GET | `/v1/api/admin/schedules/{task_id}/runs` | unclaimed |
@@ -161,6 +161,91 @@ reshaping URLs. The `owner` in the 501 body is the ticket.
 
 "Unclaimed" means no ticket in story OTI-698 declares it yet. If a test needs
 one, say so on the harness ticket rather than adding a silent path here.
+
+## Transcripts (OTI-5736)
+
+A session's conversation is `record["messages"]`, oldest first, and it comes
+back from three places that all read the same list: `detail` under `messages`,
+`history` on the session's own surface, and the seed/plant helpers. A session
+with no turns holds `[]` — never `null`, never a missing key — because
+`detail.get("messages") or []` cannot tell "absent" from "empty" and a missing
+key is how a real sync wipes a good mirror.
+
+### The message shape
+
+Every row is normalised by `state.normalise_message()` on the way in — whatever
+wrote it (a create's `initial_message`, a seed, a plant, a rewind survivor), so
+there is exactly one spelling and a test cannot pass against a shape the addon
+does not parse:
+
+| Key | Always | Notes |
+|---|---|---|
+| `role` | yes | `user` / `assistant` / `tool` / `system`. Anything else is **refused**, not stored: `turnstone_message._render` silently *skips* an unknown role, so accepting one would make a seeded turn vanish from the mirror with no error anywhere |
+| `content` | yes | A string, or a list of `{"type":"text","text":…}` parts. A bare string inside a part list is wrapped into a part, because the parser reads `part.get("text")` and would otherwise read the turn as `""` |
+| `timestamp` | yes | Epoch seconds by default (stepping 1 ms per row so an untimed fixture still reads in order), or a value you supply. The addon ignores it; a chat UI shows one |
+| `tool_calls` | when present | Canonical OpenAI: `[{"id","type":"function","function":{"name","arguments"}}]` with `arguments` a **JSON string**. A loose `{name, arguments}` is upgraded and a dict `arguments` is dumped, because `turnstone_session._sync_linked_records` json.loads the string to find the model name it links the call to |
+| `tool_call_id` | on a `tool` result | `call_id` is accepted on input and normalised to `tool_call_id`, the spelling both parsers prefer |
+
+The body key is `content`, not `text`: `turnstone_message._render` reads
+`msg.get("content")`. `text` works as an input alias and is never written.
+
+```sh
+T='Authorization: Bearer mock-token'; B=http://localhost:8099
+
+# A console create makes a COORDINATOR (see the split below), so plant and read
+# it on the console path. For an interactive session use
+# /v1/api/route/workstreams/new and the /route/ twins instead.
+curl -X POST -H "$T" $B/v1/api/workstreams/new -d '{"name":"Planted"}'
+
+# Plant a transcript on a session you already created
+curl -X POST -H "$T" $B/v1/api/admin/mock/seed \
+  -d '{"append":true,"ws_id":"ws-000001","messages":[
+        {"role":"user","content":"hello"},
+        {"role":"assistant","content":"canned",
+         "tool_calls":[{"name":"odoo_create","arguments":{"model":"res.partner"}}]},
+        {"role":"tool","content":"{\"id\": 7}","call_id":"call-1-0"}]}'
+
+curl -H "$T" $B/v1/api/workstreams/ws-000001/history     # the same rows detail carries
+curl -X POST -H "$T" $B/v1/api/workstreams/ws-000001/rewind -d '{"turns":1}'
+# {"dropped":3,"remaining":0,"turns":1,"status":"ok","ws_id":"ws-000001"}
+```
+
+### Grounded in the real server, not guessed
+
+The paths, the `limit`/`turns` parameters and the two response shapes were read
+from the published `openapi.json` of a real Turnstone 1.8.3 (it is served
+without auth), so the mock cannot quietly model an API that does not exist:
+`WorkstreamHistoryResponse` = `{ws_id, messages, cursor, handoff_token}`,
+`RewindRequest` = `{turns}` and `StatusResponse` = `{status}`.
+
+Two deliberate divergences, both about the harness being *more* useful than the
+real server, and both recorded where they live in the code:
+
+* **The tail defaults to the whole transcript.** The real `detail` defaults to
+  `message_limit=20` and `history` to `limit=100`. A silent 20-row default would
+  truncate exactly the fixtures this mock exists to serve, so a tail is applied
+  only when you ask for one. OTI-5740 owns reproducing the bounded tail as a
+  *failure mode*, on purpose.
+* **`history` answers on both surfaces.** 1.8.3's spec lists the console path
+  only. The route twin exists so an interactive session's transcript is
+  readable at all; the pairing is still decided in `resolve_session`, so the
+  console path refuses an interactive session exactly as before. If OTI-5763
+  confirms interactive history is only served through cluster detail, the twin
+  should be withdrawn rather than kept for symmetry.
+
+### Rewind is how a transcript gets shorter
+
+`rewind` drops the last N **user turns** and everything answering them — it
+finds the Nth `user` row from the end and truncates there, rather than deleting
+the last N rows, which would leave half a turn behind. `turns` is clamped to
+what the session has, exactly as the real endpoint documents. This exists
+because a mirror that only ever grows cannot be shown to follow the server:
+OTI-5744's guards are written against a shorter list that is not a prefix of
+ours, and a test needs to cause one on demand.
+
+The status body also carries `dropped` and `remaining`, which the real server
+does not send — additive on a response nothing parses strictly, so an assertion
+can say "three rows went, none left" without a second read.
 
 ## Creating workstreams, and the split at creation time
 
@@ -324,9 +409,10 @@ This ticket (OTI-5733) is the core: bind/auth/404/route table. Then:
   "Creating workstreams" and "Listing and detail" above. The detail endpoint
   returns `messages` from whatever a create's `initial_message` or a seed
   planted; the message *shapes* are OTI-5736's.
-* **OTI-5736** — transcripts: `detail` carries `messages`, a history endpoint
-  mirrors it, and `state.py` gains the seed helper for pre-planted transcripts.
-  (The seed helper already exists from OTI-5733; 5736 owns the shapes.)
+* **OTI-5736** — transcripts: `detail` carries `messages`, `history` mirrors it
+  on both surfaces, and `state.py` normalises every row and can plant one.
+  **Done**: see "Transcripts" above. `rewind` came with it, because it is the
+  only way a transcript gets shorter.
 * **OTI-5738** — prompt post appends the user turn plus one canned assistant
   turn and moves the token counters.
 * **OTI-5740** — switchable failure modes (500, slow, malformed JSON, empty
