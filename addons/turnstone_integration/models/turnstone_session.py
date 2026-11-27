@@ -16,7 +16,11 @@ import re
 from odoo import _, api, fields, models
 from odoo.exceptions import AccessError, UserError
 
-from .turnstone_client import TurnstoneError, TurnstoneNotFound
+from .turnstone_client import (
+    SESSION_DETAIL_MESSAGE_LIMIT,
+    TurnstoneError,
+    TurnstoneNotFound,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -452,6 +456,12 @@ class TurnstoneSession(models.Model):
             if messages is not None:
                 vals["sync_note"] = self.env["turnstone.message"]._replace_transcript(
                     self, messages, authoritative=authoritative,
+                    # A response that FILLS the page this call asked for is
+                    # possibly a tail: the server serves `message_limit` rows and
+                    # says nothing about having truncated, and a rolling window
+                    # never shortens, so no length comparison can catch it. This
+                    # is the one caller that knows what it asked for.
+                    fetch_limit=SESSION_DETAIL_MESSAGE_LIMIT,
                 ) or False
             self.sudo().write(vals)
 
@@ -666,7 +676,7 @@ class TurnstoneSession(models.Model):
             return "closed"
         return "thinking"
 
-    def _sync_messages(self, messages, authoritative=False):
+    def _sync_messages(self, messages, authoritative=False, fetch_limit=None):
         """Replace the mirrored transcript. Thin alias for the message model.
 
         Kept because it is what the rest of this module (and the README) calls
@@ -678,11 +688,13 @@ class TurnstoneSession(models.Model):
         or retry a turn, which removes messages. Diffing an append-only log
         against a mutable one is how you end up showing a reply that was taken
         back. What that rule must NOT mean is "replace with any response that
-        arrives" — see the guards in ``_replace_transcript``.
+        arrives" — see the guards in ``_replace_transcript``, including the
+        at-the-fetch-limit case that ``fetch_limit`` enables (an ordinary poll's
+        default, and the reason a rolling window cannot quietly drop the head).
         """
         self.ensure_one()
         return self.env["turnstone.message"]._replace_transcript(
-            self, messages, authoritative=authoritative,
+            self, messages, authoritative=authoritative, fetch_limit=fetch_limit,
         )
 
     def _sync_linked_records(self, messages):

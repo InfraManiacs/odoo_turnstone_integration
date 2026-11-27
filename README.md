@@ -213,6 +213,29 @@ explicitly, and anything else is refused with the reason kept on the session in
 `sync_note`. Only a **404** clears a transcript, and it sets `remote_gone` and
 logs `sync_remote_gone` so an empty transcript always has a reason attached.
 
+**A transcript that fills the fetch limit is possibly partial, and says so.**
+`/cluster/ws/{id}/detail` answers with a *tail* (`message_limit`, default 20,
+clamped 200) and carries no `total`, no `has_more` and no offset — so a response
+of exactly the limit cannot be told apart from the whole conversation. That is a
+state the prefix rule above structurally cannot catch, because a rolling window
+never changes length: once a conversation fills the page, every new turn pushes
+the oldest out and the mirror would lose its head on every poll, silently. On a
+real Turnstone 1.8.3 that is exactly what happened — 17 of 107 workstreams hold
+more than 200 rows. So a page that reaches the limit is treated as possibly
+partial:
+
+- it is **applied** when it starts with everything stored, or repeats the
+  stored tail after the window slid (`turnstone.message._overlap`, which needs 20
+  consecutive matching rows so a coincidence cannot splice two stretches
+  together) — and the stored turns the window slid past are kept in front, so
+  nothing mirrored is dropped and a long chat keeps updating;
+- a page that does not provably continue the mirror is **refused** rather than
+  applied, because the limit rather than a rewind is why it does not line up;
+- either way `sync_note` names the limit, so the transcript is never presented
+  as complete when it may not be. The note also names the deeper door where one
+  exists: a coordinator's console `/workstreams/{id}/history?limit=500` reaches
+  further back, while an interactive session has no equivalent endpoint at all.
+
 **A failed read never touches the mirror.** Transport errors, a non-JSON body,
 and an HTTP 200 carrying `{"error": …}` (which is what the console answers for
 a session it cannot serve) all raise before anything is written, so the chat
