@@ -421,6 +421,82 @@ class TurnstoneAutomationRun(models.Model):
         return self.browse(found.ids)
 
     @api.model
+    def _open_for_event(self, automation, idempotency_key, *, record=None,
+                        dedupe_token=None):
+        """The run for this event, opening one if there is none. ``(run, created)``.
+
+        `_find_by_key()` followed by `create()` has a window two concurrent
+        callers can both walk through: a webhook delivered twice at once, or a
+        cron overlapping itself, both find nothing and both create. The unique
+        constraint catches it — but as an `IntegrityError`, which would fail one
+        of the two callers instead of telling it that the event is already
+        handled. So the insert is attempted inside a savepoint and, when the
+        constraint refuses it, the row the other caller wrote is returned with
+        ``created=False``. That caller owns the launch; this one has nothing to
+        do.
+
+        ``created=False`` is therefore not an error and not a duplicate run: it
+        is the answer "someone else got here first". The caller must only launch
+        when ``created`` is True.
+        """
+        existing = self._find_by_key(automation, idempotency_key)
+        if existing:
+            return existing, False
+        vals = {
+            "automation_id": automation.id,
+            "idempotency_key": idempotency_key,
+        }
+        if dedupe_token:
+            vals["dedupe_token"] = dedupe_token
+        if record:
+            # Plain text, not a reference: the model may be uninstalled later and
+            # the run still has to say what it was about.
+            vals["trigger_res_model"] = record._name
+            vals["trigger_res_id"] = record.id
+        try:
+            with self.env.cr.savepoint():
+                return self.sudo().create(vals), True
+        except Exception:  # noqa: BLE001 - the constraint is not the only writer
+            # Re-read rather than guess: if the row is there now, this insert lost
+            # a race and the other transaction's run is the one to use. If it is
+            # not, the failure was something else (a missing column, a bad value)
+            # and re-raising it is the honest answer.
+            raced = self._find_by_key(automation, idempotency_key)
+            if raced:
+                return raced, False
+            raise
+
+    @api.model
+    def _lock_for_retry(self, run):
+        """The run if this caller may retry it, or an empty recordset.
+
+        A retry is the one place the unique constraint cannot help: the row
+        already exists, so two callers retrying the same key would both find it
+        `failed`, both move it to `running` and both start a session — and the
+        key would then mean two workstreams, which is the whole thing it exists
+        to prevent. So the retry claims the row under a database lock and re-reads
+        its state from the database, not from this transaction's cache: whoever
+        loses sees a run that is no longer `failed` and returns it untouched.
+
+        Used only on the retry path, because only there does the run pre-exist
+        with a state that permits another attempt.
+        """
+        if not run:
+            return self.browse()
+        self.env.cr.execute(
+            "SELECT id FROM turnstone_automation_run WHERE id = %s FOR UPDATE",
+            [run.id],
+        )
+        if not self.env.cr.fetchone():
+            return self.browse()
+        locked = self.sudo().browse(run.id)
+        # The lock says the row is ours; the cache may still hold the state it
+        # had before the other transaction committed, and only the database's
+        # answer decides whether an attempt is still allowed.
+        locked.invalidate_recordset()
+        return locked if locked.state == "failed" else self.browse()
+
+    @api.model
     def _window_duplicate(self, automation, dedupe_token):
         """A run of `automation` about this token that is still inside the window.
 
