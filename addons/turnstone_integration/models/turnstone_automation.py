@@ -81,6 +81,13 @@ class TurnstoneAutomation(models.Model):
     _name = "turnstone.automation"
     _description = "Turnstone Agent Automation Rule"
     _order = "name, id"
+    # `mail.thread` for one reason: a rule is a decision several administrators
+    # take together ("should this fire on every write, or only on priority 3?"),
+    # and the reasoning belongs next to the rule rather than in someone's inbox.
+    # It adds no tracking — the fields here are configuration, and a prompt
+    # template pasted into a chatter message would put business-record-shaped
+    # text in a second place for no benefit.
+    _inherit = ["mail.thread"]
     # Company consistency for `agent_id` and `run_as_user_id` is enforced by
     # Odoo on every create and write, against each model's own company rule.
     # Checked by hand in a constraint it would drift from core: an agent's
@@ -210,6 +217,15 @@ class TurnstoneAutomation(models.Model):
     # -- counters -----------------------------------------------------------
     run_count = fields.Integer(readonly=True, copy=False, default=0)
     last_run_at = fields.Datetime(readonly=True, copy=False)
+    # The run history, for the read-only list on this rule's form. It is the
+    # rule's own view of `turnstone.automation.run`, so it goes no wider than
+    # the run's company record rule already allows.
+    run_ids = fields.One2many(
+        "turnstone.automation.run", "automation_id", string="Runs",
+        readonly=True,
+        help="Every firing of this rule, newest first — including the ones that "
+             "never reached an agent, and why.",
+    )
 
     _name_company_uniq = models.Constraint(
         "unique(name, company_id)",
@@ -629,6 +645,22 @@ class TurnstoneAutomation(models.Model):
         return fields.Datetime.now() - timedelta(
             minutes=self.dedupe_window_minutes
         )
+
+    def action_view_runs(self):
+        """Open this rule's run history, as a list scoped to the rule.
+
+        Built here rather than referenced as an xmlid so the button works
+        without the action record having to be loaded first, and so the domain
+        is this rule's, never the caller's to widen.
+        """
+        self.ensure_one()
+        return {
+            "type": "ir.actions.act_window",
+            "name": _("Automation Runs"),
+            "res_model": "turnstone.automation.run",
+            "view_mode": "list",
+            "domain": [("automation_id", "=", self.id)],
+        }
 
     def _note_run(self, when=None):
         """Count one run and stamp its time. Called by the launch service.

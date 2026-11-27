@@ -1,0 +1,334 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <!--
+        Views for the automation pair: the rule (turnstone.automation) and its
+        run history (turnstone.automation.run).
+
+        Three decisions are visible in this file and worth stating once:
+
+        1. The rule form is the whole configuration of an automation, grouped by
+           the three questions an administrator actually asks — when does it
+           fire, what does it ask, and who does it run as. A field that is not on
+           this form is a field nobody can set, because the rule model is
+           administrator-only at the ACL level and has no other UI.
+
+        2. The run list is embedded read-only on the rule's form. A run is
+           history, and the only writer is the launch service: there is no
+           "create a run" button, and the list is not editable. What it does show
+           is the three things a person asks of it — did it fire, what was it
+           about, and if it did not reach an agent, why.
+
+        3. The prompt field carries a field-insert helper (the small button in
+           the field), because the prompt language is `{{ field_name }}` and
+           nothing else. The helper can only produce paths the server's own
+           `_parse_field_path()` accepts, so the button cannot write a template
+           that fails on save.
+    -->
+
+    <!-- ============================== the rule ============================== -->
+
+    <record id="view_turnstone_automation_list" model="ir.ui.view">
+        <field name="name">turnstone.automation.list</field>
+        <field name="model">turnstone.automation</field>
+        <field name="arch" type="xml">
+            <list string="Automations" decoration-muted="not active">
+                <field name="name"/>
+                <field name="agent_id"/>
+                <field name="trigger_type"/>
+                <field name="target_model_id"/>
+                <field name="run_as" optional="show"/>
+                <field name="run_count" string="Runs" optional="show"/>
+                <field name="last_run_at" optional="show"/>
+                <field name="active" column_invisible="True"/>
+                <field name="company_id" groups="base.group_multi_company" optional="hide"/>
+            </list>
+        </field>
+    </record>
+
+    <record id="view_turnstone_automation_form" model="ir.ui.view">
+        <field name="name">turnstone.automation.form</field>
+        <field name="model">turnstone.automation</field>
+        <field name="arch" type="xml">
+            <form string="Automation">
+                <sheet>
+                    <div class="oe_button_box" name="button_box">
+                        <button name="action_view_runs" type="object" class="oe_stat_button"
+                                icon="fa-history" invisible="not id">
+                            <field name="run_count" widget="statinfo" string="Runs"/>
+                        </button>
+                    </div>
+                    <field name="active" invisible="1"/>
+                    <widget name="web_ribbon" title="Archived" bg_color="text-bg-danger"
+                            invisible="active"/>
+                    <div class="oe_title">
+                        <label for="name"/>
+                        <h1>
+                            <field name="name" placeholder="New helpdesk ticket: first response"/>
+                        </h1>
+                    </div>
+                    <group>
+                        <group string="Status">
+                            <field name="active" widget="boolean_toggle"/>
+                            <field name="last_run_at" readonly="1"
+                                   invisible="not run_count"/>
+                            <field name="company_id" groups="base.group_multi_company"
+                                   options="{'no_create': True}"/>
+                        </group>
+                        <group string="Agent">
+                            <field name="agent_id" options="{'no_create': True}"/>
+                            <div colspan="2" class="text-muted small">
+                                The agent decides what a run can do — its skill, persona, model
+                                and approval policy. A rule cannot widen any of them.
+                            </div>
+                        </group>
+                    </group>
+                    <group string="When it fires">
+                        <group>
+                            <field name="trigger_type"/>
+                            <field name="target_model_id" options="{'no_create': True}"
+                                   invisible="trigger_type in ('webhook', 'manual')"/>
+                            <field name="target_model" invisible="1"/>
+                            <field name="trigger_field_ids" widget="many2many_tags"
+                                   options="{'no_create': True, 'no_open': True}"
+                                   domain="[('model_id', '=', target_model_id), ('store', '=', True)]"
+                                   invisible="trigger_type not in ('record_write', 'record_create_or_write')"
+                                   placeholder="Any change fires it"/>
+                            <div colspan="2" class="text-muted small"
+                                 invisible="trigger_type not in ('record_write', 'record_create_or_write')">
+                                Leave empty to fire on any change. Name fields here if this rule's
+                                agent also writes the record it watches, or the two will loop.
+                            </div>
+                        </group>
+                        <group>
+                            <field name="target_domain" widget="domain"
+                                   options="{'model': 'target_model', 'in_dialog': True, 'foldable': True}"
+                                   invisible="trigger_type in ('webhook', 'manual')"
+                                   placeholder="[('priority', '=', '3')]"/>
+                            <div colspan="2" class="text-muted small"
+                                 invisible="trigger_type in ('webhook', 'manual')">
+                                Optional. A record outside this filter does not fire the rule.
+                            </div>
+                            <div colspan="2" class="text-muted small"
+                                 invisible="trigger_type not in ('webhook', 'manual')">
+                                This trigger carries its own context, so it needs no target model
+                                and no record filter.
+                            </div>
+                        </group>
+                    </group>
+                    <group string="What it asks">
+                        <field name="prompt_template" widget="turnstone_prompt_template"
+                               nolabel="1" colspan="2" rows="12"
+                               placeholder="Summarise this ticket and draft the first reply to the customer."/>
+                        <div colspan="2" class="text-muted small">
+                            Write the instruction the agent receives. Pull record values in with
+                            <code>{{ field_name }}</code> or a path through a link such as
+                            <code>{{ partner_id.name }}</code> — use the button in the field to pick
+                            one. Only those references are allowed; nothing is evaluated.
+                        </div>
+                        <field name="store_prompt"/>
+                        <div colspan="2" class="text-muted small">
+                            Off by default. The rendered prompt is built from business records, so
+                            turn this on while debugging a rule and back off afterwards.
+                        </div>
+                    </group>
+                    <group string="Who it runs as">
+                        <group>
+                            <field name="run_as"/>
+                            <field name="run_as_user_id" options="{'no_create': True}"
+                                   invisible="run_as != 'fixed_user'"/>
+                            <div colspan="2" class="text-muted small"
+                                 invisible="run_as != 'fixed_user'">
+                                Used only when Run As is a specific user: someone allowed to use the
+                                agent and the server, in this rule's company.
+                            </div>
+                        </group>
+                        <group>
+                            <field name="dedupe_window_minutes"/>
+                            <div colspan="2" class="text-muted small">
+                                How far back to look for a run of this rule on the same record
+                                before starting another. 0 disables the window.
+                            </div>
+                        </group>
+                    </group>
+                    <notebook>
+                        <page string="Runs" name="runs">
+                            <field name="run_ids" nolabel="1">
+                                <list create="false" delete="false" edit="false"
+                                      decoration-success="state == 'done'"
+                                      decoration-danger="state == 'failed'"
+                                      decoration-muted="state == 'skipped'">
+                                    <field name="create_date" string="When"/>
+                                    <field name="state" widget="badge"/>
+                                    <field name="trigger_res_model" string="Trigger Model"/>
+                                    <field name="trigger_res_id" string="Record"/>
+                                    <field name="attempt_count" string="Tries" optional="hide"/>
+                                    <field name="session_id" optional="show"/>
+                                    <field name="error" optional="show"/>
+                                </list>
+                            </field>
+                            <div class="text-muted small mt-2">
+                                A run records the launch, not the agent's work: Done means a session
+                                exists and the prompt reached it. A skipped run was suppressed by the
+                                window above, or refused before anything was tried.
+                            </div>
+                        </page>
+                    </notebook>
+                </sheet>
+                <chatter/>
+            </form>
+        </field>
+    </record>
+
+    <record id="view_turnstone_automation_search" model="ir.ui.view">
+        <field name="name">turnstone.automation.search</field>
+        <field name="model">turnstone.automation</field>
+        <field name="arch" type="xml">
+            <search>
+                <field name="name"/>
+                <field name="agent_id"/>
+                <field name="target_model_id"/>
+                <filter name="archived" string="Archived"
+                        domain="[('active', '=', False)]"/>
+                <separator/>
+                <filter name="watches_records" string="Watches Records"
+                        domain="[('trigger_type', 'in', ['record_create', 'record_write', 'record_create_or_write', 'chatter_message', 'schedule'])]"/>
+                <filter name="unattended" string="Runs Unattended"
+                        domain="[('trigger_type', 'in', ['schedule', 'webhook'])]"/>
+                <separator/>
+                <group name="group_by">
+                    <filter name="by_agent" string="Agent" context="{'group_by': 'agent_id'}"/>
+                    <filter name="by_trigger" string="Trigger" context="{'group_by': 'trigger_type'}"/>
+                    <filter name="by_target_model" string="Target Model"
+                            context="{'group_by': 'target_model_id'}"/>
+                    <filter name="by_run_as" string="Run As" context="{'group_by': 'run_as'}"/>
+                </group>
+            </search>
+        </field>
+    </record>
+
+    <record id="action_turnstone_automation" model="ir.actions.act_window">
+        <field name="name">Automations</field>
+        <field name="res_model">turnstone.automation</field>
+        <field name="view_mode">list,form</field>
+        <field name="help" type="html">
+            <p class="o_view_nocontent_smiling_face">Ask an agent when something happens</p>
+            <p>
+                A rule says when to ask, what to ask, and who the run is attributed to.
+                The agent itself — its skill, persona, model and approvals — is configured
+                once under Agents, so the same agent can answer a human in the chat and a
+                new ticket at 03:00 without being defined twice.
+            </p>
+        </field>
+    </record>
+
+    <!-- ============================ run history ============================= -->
+
+    <record id="view_turnstone_automation_run_list" model="ir.ui.view">
+        <field name="name">turnstone.automation.run.list</field>
+        <field name="model">turnstone.automation.run</field>
+        <field name="arch" type="xml">
+            <list string="Automation Runs" create="false" delete="false" edit="false"
+                  decoration-success="state == 'done'"
+                  decoration-danger="state == 'failed'"
+                  decoration-muted="state == 'skipped'">
+                <field name="create_date" string="When"/>
+                <field name="automation_id"/>
+                <field name="state" widget="badge"/>
+                <field name="trigger_res_model" string="Trigger Model" optional="show"/>
+                <field name="trigger_res_id" string="Record" optional="show"/>
+                <field name="attempt_count" string="Tries" optional="hide"/>
+                <field name="session_id" optional="show"/>
+                <field name="error" optional="show"/>
+                <field name="finished_at" optional="hide"/>
+                <field name="company_id" groups="base.group_multi_company" optional="hide"/>
+            </list>
+        </field>
+    </record>
+
+    <record id="view_turnstone_automation_run_form" model="ir.ui.view">
+        <field name="name">turnstone.automation.run.form</field>
+        <field name="model">turnstone.automation.run</field>
+        <field name="arch" type="xml">
+            <form string="Automation Run" create="false" delete="false" edit="false">
+                <sheet>
+                    <div class="oe_title">
+                        <h1><field name="name" readonly="1"/></h1>
+                    </div>
+                    <group>
+                        <group string="Launch">
+                            <field name="automation_id" readonly="1"/>
+                            <field name="state" widget="badge" readonly="1"/>
+                            <field name="attempt_count" readonly="1"/>
+                            <field name="session_id" readonly="1"/>
+                            <field name="company_id" groups="base.group_multi_company"
+                                   readonly="1"/>
+                        </group>
+                        <group string="Event">
+                            <field name="trigger_res_model" readonly="1"/>
+                            <field name="trigger_res_id" readonly="1"/>
+                            <field name="idempotency_key" readonly="1"/>
+                            <field name="dedupe_token" readonly="1"/>
+                        </group>
+                    </group>
+                    <group string="Timing">
+                        <field name="queued_at" readonly="1"/>
+                        <field name="started_at" readonly="1"/>
+                        <field name="finished_at" readonly="1"/>
+                    </group>
+                    <div class="alert alert-danger" role="alert" invisible="not error">
+                        <field name="error" nolabel="1" readonly="1"/>
+                    </div>
+                    <group string="Rendered Prompt" invisible="not prompt">
+                        <field name="prompt" nolabel="1" colspan="2" readonly="1"/>
+                    </group>
+                </sheet>
+            </form>
+        </field>
+    </record>
+
+    <record id="view_turnstone_automation_run_search" model="ir.ui.view">
+        <field name="name">turnstone.automation.run.search</field>
+        <field name="model">turnstone.automation.run</field>
+        <field name="arch" type="xml">
+            <search>
+                <field name="automation_id"/>
+                <field name="trigger_res_model"/>
+                <field name="session_id"/>
+                <field name="idempotency_key"/>
+                <filter name="failed" string="Failed"
+                        domain="[('state', '=', 'failed')]"/>
+                <filter name="skipped" string="Skipped"
+                        domain="[('state', '=', 'skipped')]"/>
+                <filter name="in_flight" string="Queued or Running"
+                        domain="[('state', 'in', ['queued', 'running'])]"/>
+                <separator/>
+                <filter name="today" string="Today"
+                        domain="[('create_date', '&gt;=', 'today'), ('create_date', '&lt;', 'today +1d')]"/>
+                <group name="group_by">
+                    <filter name="by_automation" string="Automation"
+                            context="{'group_by': 'automation_id'}"/>
+                    <filter name="by_state" string="State" context="{'group_by': 'state'}"/>
+                    <filter name="by_trigger_model" string="Trigger Model"
+                            context="{'group_by': 'trigger_res_model'}"/>
+                    <filter name="by_day" string="Day" context="{'group_by': 'create_date:day'}"/>
+                </group>
+            </search>
+        </field>
+    </record>
+
+    <record id="action_turnstone_automation_run" model="ir.actions.act_window">
+        <field name="name">Automation Runs</field>
+        <field name="res_model">turnstone.automation.run</field>
+        <field name="view_mode">list,form</field>
+        <field name="help" type="html">
+            <p class="o_view_nocontent_smiling_face">No automation has fired yet</p>
+            <p>
+                Every attempt is recorded here — including the ones that never reached an
+                agent, and why. Runs are written by the launch service; nothing on this
+                screen can create or change one.
+            </p>
+        </field>
+    </record>
+
+</odoo>
