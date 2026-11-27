@@ -99,7 +99,8 @@ second spelling for the same value is how two halves of a transcript drift.
 
 Nothing in this module implements agent behaviour, and nothing in it should:
 no model call, no tool execution, no timing simulation. A canned reply is a
-string read from the environment (OTI-5738); that is the whole of it.
+string read from the environment (OTI-5738, `DEFAULT_REPLY` with
+`MOCK_TURNSTONE_REPLY` overriding it); that is the whole of it.
 """
 
 import copy
@@ -171,6 +172,57 @@ DEFAULT_MODEL_ALIAS = DEFAULT_MODELS[0]["alias"]
 # seconds for as long as a test runs; the counter keeps counting past the cap so
 # "how many sends arrived" stays correct even when the log has rolled over.
 REQUEST_LOG_LIMIT = 500
+
+# The assistant reply this server gives every prompt (OTI-5738).
+#
+# A constant, not a completion: the mock runs no model, so the only honest reply
+# is one a test can predict character for character. It names the variable that
+# changes it, because the first question asked of any transcript is "where did
+# that text come from". `server.Config` reads MOCK_TURNSTONE_REPLY and falls back
+# here, so the default lives in one place.
+DEFAULT_REPLY = (
+    "Mock reply: no model was called. This text comes from MOCK_TURNSTONE_REPLY."
+)
+
+
+# `tokens` in the detail payload is a number the addon displays
+# (`turnstone_session.token_count`), so a send has to move it: a reply that cost
+# nothing makes the mirror show a conversation of zero size. There is no
+# tokenizer here and there should not be (stdlib only, and a tokenizer would be a
+# dependency pretending to be accuracy); this is the usual
+# four-characters-per-token estimate, applied to both sides of a turn.
+# Deterministic is the requirement — a test asserts this arithmetic, not the
+# number a real model would burn.
+def estimate_tokens(text):
+    """A deterministic token estimate for one side of a turn. Never 0."""
+    return max(1, (len(text) + 3) // 4)
+
+
+# One forced approval cycle, shaped like the real `PendingApprovalDetail` from
+# Turnstone 1.8.3's /openapi.json: an envelope per live cycle, with the tool call
+# nested one level down under `items[]`.
+#
+# The nesting is load-bearing. `turnstone_session._flatten_approvals` reads
+# `cycle_id` from the envelope and `func_name`/`preview` from the item, so a flat
+# list of tool calls would render in the chat as an approval with no tool name —
+# the panel would open and show nothing to decide about.
+DEFAULT_APPROVAL_DETAILS = (
+    {
+        "cycle_id": "cycle-mock-1",
+        "call_id": "call-mock-1",
+        "judge_pending": False,
+        "items": [
+            {
+                "call_id": "call-mock-1",
+                "header": "Approval required",
+                "preview": "mock_write(res_model='res.partner', res_id=1)",
+                "func_name": "mock_write",
+                "approval_label": "Write a partner",
+                "needs_approval": True,
+            }
+        ],
+    },
+)
 
 # The roles the addon mirrors (`turnstone_message._render`). Anything else is
 # dropped there without a word, which is why the normaliser refuses it here
@@ -604,10 +656,9 @@ class MockState:
     def append_message(self, ws_id, message):
         """Add one turn to a session's transcript and return the stored row.
 
-        OTI-5738 appends the user turn and its canned reply through this rather
-        than editing the record itself: the counters and `updated_at` move in the
-        same lock as the transcript, so a poll cannot catch a session whose text
-        arrived before its token count did.
+        A single row. `send_turn()` is what a prompt goes through (two rows and
+        the counters, in one lock); this is here for a fixture that wants to plant
+        one row at a time, and it is what `plant_transcript` grows from.
         """
         row = normalise_message(message, index=0)
         with self.lock:
@@ -665,6 +716,147 @@ class MockState:
             self.workstreams[ws_id] = record
             return {"dropped": dropped, "remaining": len(record["messages"]),
                     "turns": turns}
+
+    # -- prompt submission (OTI-5738) --------------------------------------
+
+    def send_turn(self, ws_id, message, reply=DEFAULT_REPLY, force_approval=False):
+        """Append a user turn and its canned assistant reply, as one operation.
+
+        The whole point of this method, rather than two calls to
+        `append_message()`, is the lock: transcript, counters, `updated_at` and
+        the optional approval all move together. A chat polling detail while a
+        send is in flight either sees the session before the send or both turns
+        after it — never a user message with no reply and a token count that has
+        not caught up. That half-state is exactly what a flaky test would be
+        written against, and it would be the mock's fault rather than the
+        client's.
+
+        This is where the mock's "no agent behaviour" line is drawn and made
+        explicit: the reply is `reply`, a string handed in by the caller (from
+        the environment, via `server.Config`), not anything derived from the
+        message. No model is called, no tool runs, nothing is timed. Two sends
+        of the same text produce two identical turns, which is what makes a
+        transcript assertion possible at all.
+
+        `force_approval` is the approval-path hook: it parks the session in
+        `attention` with a `pending_approval_details` cycle, so a test does not
+        need a real gate thread (which this server will never have) to exercise
+        the approve/deny UI. The flag is per send, so a test can drive the same
+        session from a normal reply to a gated one.
+
+        Returns the two stored rows plus the counters after the write, so a
+        handler can answer without re-reading the record.
+        """
+        if not isinstance(message, str) or not message.strip():
+            raise ValueError("message must be a non-empty string")
+        body = message.strip()
+        if not isinstance(reply, str):
+            raise ValueError("reply must be a string")
+
+        user_row = normalise_message({"role": "user", "content": body}, index=0)
+        assistant_row = normalise_message(
+            {"role": "assistant", "content": reply}, index=1,
+            # A hair after the user turn, so a transcript read back sorts the way
+            # a conversation reads even though the two rows were built together.
+            default_timestamp=float(user_row["timestamp"]) + 0.001,
+        )
+
+        with self.lock:
+            record = self.workstreams.get(ws_id)
+            if record is None:
+                raise KeyError("no such workstream: %s" % ws_id)
+            record = copy.deepcopy(record)
+            rows = list(record.get("messages") or [])
+            rows.append(user_row)
+            rows.append(assistant_row)
+            record["messages"] = rows
+            if not record.get("title"):
+                record["title"] = _derived_title(user_row)
+
+            # Counters: both sides of the turn, so a session that has had one
+            # exchange reports a size that grows with the conversation rather
+            # than staying at the create's zero.
+            record["tokens"] = int(record.get("tokens") or 0) + (
+                estimate_tokens(body) + estimate_tokens(reply)
+            )
+            # `tool_calls` is deliberately untouched: no tool is executed by this
+            # server, and a send that incremented it would be the mock claiming
+            # agent work it did not do.
+
+            if force_approval:
+                # attention, not idle: `sync_from_server` maps a pending approval
+                # to attention regardless of the raw state, so answering idle
+                # with a pending cycle would hand the addon a contradiction it
+                # silently corrects instead of a state a test can assert on.
+                record["state"] = "attention"
+                record["pending_approval_details"] = copy.deepcopy(
+                    list(DEFAULT_APPROVAL_DETAILS)
+                )
+                record["activity"] = "Waiting for approval"
+                record["activity_state"] = "attention"
+            else:
+                # The turn is complete the moment it is written (there is
+                # nothing to wait for), so the session is idle again rather than
+                # stuck in `thinking`, which would make every chat poll show a
+                # spinner for work that already finished.
+                record["state"] = "idle"
+
+            record["updated_at"] = time.time()
+            self.workstreams[ws_id] = record
+            return {
+                "user": copy.deepcopy(user_row),
+                "assistant": copy.deepcopy(assistant_row),
+                "message_count": len(rows),
+                "tokens": record["tokens"],
+                "tool_calls": record["tool_calls"],
+                "state": record["state"],
+                "pending_approval_details": copy.deepcopy(
+                    record["pending_approval_details"]
+                ),
+            }
+
+    def force_approval(self, ws_id, details=None):
+        """Park a session in `attention` with a pending approval cycle.
+
+        The in-process twin of `POST /v1/api/admin/mock/seed`'s
+        `pending_approval_details`: a test that can import this module should not
+        have to drive an HTTP request to arrange an approval. Also the way to
+        put an approval on a session *after* it exists, which seeding cannot do.
+
+        `details=None` uses `DEFAULT_APPROVAL_DETAILS` (one cycle, one tool
+        call). Returns the stored record.
+        """
+        with self.lock:
+            record = self.workstreams.get(ws_id)
+            if record is None:
+                raise KeyError("no such workstream: %s" % ws_id)
+            record = copy.deepcopy(record)
+            record["pending_approval_details"] = copy.deepcopy(
+                list(DEFAULT_APPROVAL_DETAILS if details is None else details)
+            )
+            record["state"] = "attention"
+            record["updated_at"] = time.time()
+            self.workstreams[ws_id] = record
+            return copy.deepcopy(record)
+
+    def clear_approval(self, ws_id):
+        """Drop any pending approval and return the session to `idle`.
+
+        The other half of `force_approval`: a test that has resolved an approval
+        needs the state to go back, and no endpoint here does that yet
+        (`POST .../approve` is still an unclaimed stub).
+        """
+        with self.lock:
+            record = self.workstreams.get(ws_id)
+            if record is None:
+                raise KeyError("no such workstream: %s" % ws_id)
+            record = copy.deepcopy(record)
+            record["pending_approval_details"] = []
+            if record["state"] == "attention":
+                record["state"] = "idle"
+            record["updated_at"] = time.time()
+            self.workstreams[ws_id] = record
+            return copy.deepcopy(record)
 
     # -- catalogue ---------------------------------------------------------
 

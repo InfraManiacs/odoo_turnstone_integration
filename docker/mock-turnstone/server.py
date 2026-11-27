@@ -32,6 +32,12 @@ Configuration, all read from the environment at startup:
     MOCK_TURNSTONE_LOG_LEVEL   logging level, default INFO. Every request is
                                logged, because "what did Odoo actually send" is
                                the first question about any test failure.
+    MOCK_TURNSTONE_REPLY       the assistant text every prompt gets, verbatim.
+                               This server runs no model, so a reply a test can
+                               predict is the only honest one. Default in
+                               `state.DEFAULT_REPLY`; setting it is how a test
+                               proves the reply is configuration and not a
+                               constant buried in a handler.
 
 Requests are matched against a declared route table before anything else, so an
 unknown path answers 404 even without a token; a known path without the right
@@ -97,6 +103,20 @@ class Config:
             "1", "true", "True", "yes",
         )
         self.log_level = env.get("MOCK_TURNSTONE_LOG_LEVEL", "INFO").upper()
+        # The canned reply every prompt gets (OTI-5738). Kept on Config rather
+        # than read at the handler because it is a *server* setting: two
+        # in-process servers in one test can answer differently, which is how a
+        # test proves the reply really comes from configuration and is not a
+        # constant buried in a handler. An empty value is refused rather than
+        # accepted: an empty reply would append an assistant turn with no text,
+        # which the addon's renderer drops, and the transcript would then look
+        # like a send that half-worked.
+        self.reply = env.get("MOCK_TURNSTONE_REPLY", state.DEFAULT_REPLY)
+        if not self.reply.strip():
+            raise ValueError(
+                "MOCK_TURNSTONE_REPLY must not be blank: it is the assistant turn every "
+                "prompt gets, and an empty one renders as a send that produced nothing"
+            )
         permissions = env.get(
             "MOCK_TURNSTONE_PERMISSIONS",
             "admin.console,admin.coordinator,admin.workstreams,admin.schedules,"
@@ -113,12 +133,13 @@ class Config:
         """A safe startup line: never prints the token itself."""
         return (
             "mock-turnstone listening on http://%s:%d (token from MOCK_TURNSTONE_TOKEN, "
-            "%d permissions, health %s)"
+            "%d permissions, health %s, reply %d chars)"
             % (
                 self.host,
                 self.port,
                 len(self.permissions),
                 "public" if self.health_public else "token-protected",
+                len(self.reply),
             )
         )
 
@@ -517,9 +538,11 @@ def handle_create_workstream_console(ctx):
     says `coordinator`. A test that wants the other behaviour must use the
     proxy, and the response is where it finds out it did not.
 
-    `initial_message` becomes the first user turn of the stored transcript. The
-    assistant side is OTI-5738's canned reply; this server performs no work, so
-    the state stays `idle` rather than pretending to be `thinking` forever.
+    `initial_message` becomes the first user turn of the stored transcript, and
+    this server answers it with the same canned reply a `send` does — the addon's
+    first message goes through this endpoint, not through send, so a create with
+    no reply would leave every session's opening prompt unanswered while later
+    ones were answered. The state stays `idle`: there is nothing to wait for.
     """
     body = ctx.json_body()
     if not isinstance(body, dict):
@@ -534,7 +557,8 @@ def handle_create_workstream_console(ctx):
         # the store's DEFAULT_MODEL_ALIAS applies, which is the node default a
         # real coordinator runs on. A `model` sent here is not in the schema and
         # is not recorded either — the console would silently ignore it.
-        messages=_initial_turn(initial),
+        messages=_initial_turns(initial, ctx.config.reply),
+        tokens=_initial_tokens(initial, ctx.config.reply),
         meta=_creation_meta(body, ("kind",)),
     )
     return 201, _creation_response(record, surface="console")
@@ -572,20 +596,53 @@ def handle_create_workstream_route(ctx):
         skill=_optional_str(body, "skill"),
         persona=_optional_str(body, "persona"),
         model_alias=_optional_str(body, "model"),
-        messages=_initial_turn(initial),
+        messages=_initial_turns(initial, ctx.config.reply),
+        tokens=_initial_tokens(initial, ctx.config.reply),
         meta=_creation_meta(body, ("client_type", "judge_model", "auto_approve",
                                    "auto_approve_tools")),
     )
     return 201, _creation_response(record, surface="route")
 
 
-def _initial_turn(initial_message):
-    """The first user turn, if the caller supplied one. There is no reply here:
-    this server runs no model, so a created session has the prompt and nothing
-    else until OTI-5738 appends a canned answer."""
+def _initial_turns(initial_message, reply):
+    """The first exchange, if the caller supplied a prompt.
+
+    A create with `initial_message` is the addon's *first* send: `action_send`
+    calls `_ensure_started(first_message=body)`, which uses `POST
+    .../workstreams/new` and never touches the send route. So this path has to
+    produce the canned assistant turn too, or the first message of every session
+    would sit in the mirror as a prompt with nothing answering it — while every
+    later message (which does go through send) got a reply. OTI-5736 recorded
+    that handoff: "the assistant side is OTI-5738's canned reply".
+
+    Same source as `handle_send`: `MOCK_TURNSTONE_REPLY`, read once at startup
+    into `Config`. There is no model call on either path, which is why the two
+    produce byte-identical replies for the same setting.
+
+    No `force_approval` here: creating a session is not a turn, and a harness that
+    gated the very first message implicitly would make it hard to test the
+    ungated path at all. A test that wants the first turn gated seeds the session
+    with `force_approval` and sends a second message.
+    """
     if not initial_message:
         return []
-    return [{"role": "user", "content": initial_message}]
+    return [
+        {"role": "user", "content": initial_message},
+        {"role": "assistant", "content": reply},
+    ]
+
+
+def _initial_tokens(initial_message, reply):
+    """Token count for a create's first exchange. 0 when there is no prompt.
+
+    The counters have to agree with the transcript however it was filled: a
+    created session holding two rows and reporting `tokens: 0` would say the
+    conversation was free, and an assertion about a session's size would have to
+    know which entry point made it.
+    """
+    if not initial_message:
+        return 0
+    return state.estimate_tokens(initial_message) + state.estimate_tokens(reply)
 
 
 def _creation_response(record, surface):
@@ -854,6 +911,128 @@ def handle_session_rewind(ctx):
 
 
 # ---------------------------------------------------------------------------
+# handlers: prompt submission (OTI-5738)
+#
+# One handler for both surfaces, because the console's `CoordinatorSendRequest`
+# and the proxy's `SendRequest` are the same body in 1.8.3 (both: `message`
+# required, optional `client_send_id` and `attachment_ids`), and the surface
+# split is already enforced in `resolve_session`. Two handlers here would be two
+# copies of the same validation with no rule to keep them in step.
+# ---------------------------------------------------------------------------
+
+# `client_send_id` is an opaque browser correlation token in 1.8.3's schema
+# (`^[A-Za-z0-9_-]+$`, 1..128). Validated here because a caller that sends an
+# object or a 500-character id is making a mistake the real server would answer
+# 400 for, and a mock that accepted it would teach the wrong body.
+_CLIENT_SEND_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
+def handle_send(ctx):
+    """POST .../workstreams/{ws_id}/send — a prompt, and its canned reply.
+
+    The whole of the mock's "conversation": append the user turn, append one
+    assistant turn read from `MOCK_TURNSTONE_REPLY` (never from the message),
+    move the token counters. No model call, no tool execution, no thinking time
+    — and the session is back to `idle` in the same locked write, so a chat that
+    polls detail afterwards sees a finished exchange rather than a spinner.
+
+    Both turns land from one `state.send_turn()` call on purpose. Two separate
+    appends would let a poll read a user message whose reply and token count had
+    not arrived, which is a half-turn the real server never exposes; a test
+    written against that would be testing the mock's scheduling.
+
+    Approval-path tests: a session whose `meta.force_approval` is set (through
+    `POST /v1/api/admin/mock/seed`) parks in `attention` with a pending approval
+    cycle instead of returning to idle. That is a fixture knob on the *session*,
+    not a field on this request, so the body stays exactly the shape 1.8.3
+    declares — a mock-only field here would be a body the real server would
+    reject, and a test could then pass against it.
+
+    Response: 1.8.3's `SendResponse`/`CoordinatorSendResponse` (`status` is the
+    required key), plus the appended rows and the post-send counters. The extras
+    are additive on a body the client ignores entirely — `TurnstoneClient.send`
+    returns it and `turnstone_session.action_send` never reads a field, it
+    re-reads detail — and they are what lets an assertion say "two rows appeared"
+    without a second request.
+
+    `attachment_ids` is accepted and answered honestly as *dropped*: no upload
+    endpoint exists in this mock yet (`POST .../attachments` is unclaimed), so no
+    id a caller can name is one this server holds, and
+    `dropped_attachment_ids` is exactly the real field for "requested, could not
+    reserve". Pretending to attach them would be the harness lying about a turn.
+    """
+    record = ctx.resolve_session()
+    body = ctx.json_body()
+    if not isinstance(body, dict):
+        raise bad_request("send body must be a JSON object")
+
+    message = body.get("message")
+    if not isinstance(message, str):
+        raise bad_request("message is required and must be a string")
+    if not message.strip():
+        raise bad_request("message must not be empty")
+
+    client_send_id = body.get("client_send_id")
+    if client_send_id is not None:
+        if not isinstance(client_send_id, str) or not _CLIENT_SEND_ID.match(client_send_id):
+            raise bad_request(
+                "client_send_id must be 1-128 characters of letters, digits, dash or underscore",
+                client_send_id=client_send_id,
+            )
+
+    attachment_ids = body.get("attachment_ids")
+    if attachment_ids is not None:
+        if not isinstance(attachment_ids, list) or not all(
+            isinstance(a, str) for a in attachment_ids
+        ):
+            raise bad_request("attachment_ids must be a list of strings")
+    else:
+        attachment_ids = []
+
+    if record.get("closed") or record.get("state") == "closed":
+        # 409 is the status the published spec declares for a send that cannot
+        # be accepted; the text is the mock's, and says what to do about it.
+        raise conflict(
+            "workstream is closed",
+            ws_id=record["id"],
+            detail="a closed session cannot take a prompt; start a new one",
+        )
+
+    force_approval = bool((record.get("meta") or {}).get("force_approval"))
+    try:
+        result = ctx.store.send_turn(
+            record["id"],
+            message,
+            reply=ctx.config.reply,
+            force_approval=force_approval,
+        )
+    except KeyError as exc:  # deleted between resolve_session and the write
+        raise not_found("workstream not found", ws_id=record["id"]) from exc
+
+    return 200, {
+        "status": "ok",
+        # Present-and-false rather than absent, as the spec sends it: a caller
+        # reading `resp["deferred"]` should not have to default it.
+        "deferred": False,
+        "ws_id": record["id"],
+        # Echoed so a browser can match the turn it just sent to the turn that
+        # appears in the transcript (this mock is synchronous, so it can always
+        # answer with them rather than making the caller poll for its own text).
+        "client_send_id": client_send_id,
+        "attached_ids": [],
+        "dropped_attachment_ids": list(attachment_ids),
+        "priority": None,
+        "msg_id": None,
+        "turns": [result["user"], result["assistant"]],
+        "message_count": result["message_count"],
+        "tokens": result["tokens"],
+        "tool_calls": result["tool_calls"],
+        "state": result["state"],
+        "pending_approval_details": result["pending_approval_details"],
+    }
+
+
+# ---------------------------------------------------------------------------
 # handlers: mock control plane
 #
 # These are NOT Turnstone endpoints. They live under /v1/api/admin/mock/ so they
@@ -885,13 +1064,21 @@ def handle_mock_seed(ctx):
     Body (all optional but kind):
         kind, name, title, state, skill, persona, model_alias, parent_ws_id,
         ws_id, tokens, tool_calls, context_ratio, activity, activity_state,
-        messages, pending_approval_details, meta, append
+        messages, pending_approval_details, meta, append, force_approval
 
     `messages` are normalised by `state.normalise_message`, so a test can seed
     the loose shape (a bare `{\"name\": ..., \"arguments\": {...}}` tool call,
     content parts, a `text` key) and read back the one spelling the addon parses.
     The response is the stored record, so an assertion reads what will be served
     rather than what was sent.
+
+    `force_approval: true` sets a flag on the session (under `meta`) so every
+    later `POST .../send` parks it in `attention` with a pending approval cycle
+    instead of returning to idle — the approval-path switch, OTI-5738. It lives
+    on the *session* rather than on the send body deliberately: the send body has
+    to keep the shape 1.8.3 declares, or a test would pass against a field the
+    real server rejects. `pending_approval_details` seeds one approval now;
+    `force_approval` is what makes the next prompt produce one.
 
     `append: true` plants `messages` onto an EXISTING workstream instead of
     creating one (then `kind` is ignored and a pinned `ws_id` is the target):
@@ -906,16 +1093,25 @@ def handle_mock_seed(ctx):
     messages = body.get("messages") or []
     if not isinstance(messages, list):
         raise bad_request("messages must be a list")
+    force_approval = body.get("force_approval")
+    if force_approval is not None and not isinstance(force_approval, bool):
+        raise bad_request("force_approval must be true or false")
 
     if body.get("append"):
         target = body.get("ws_id")
         if not target:
             raise bad_request("append needs the ws_id to plant the transcript on")
+        target = str(target)
         try:
-            rows = state.STORE.plant_transcript(str(target), messages, replace=False)
+            rows = state.STORE.plant_transcript(target, messages, replace=False)
+            if force_approval is not None:
+                updated = state.STORE.get(target)
+                updated["meta"] = dict(updated.get("meta") or {},
+                                       force_approval=force_approval)
+                state.STORE.save(updated)
         except KeyError as exc:
-            raise not_found("workstream not found", ws_id=str(target)) from exc
-        return 200, dict(state.STORE.get(str(target)), messages=rows)
+            raise not_found("workstream not found", ws_id=target) from exc
+        return 200, dict(state.STORE.get(target), messages=rows)
 
     kind = body.get("kind") or "interactive"
     if kind not in ("coordinator", "interactive"):
@@ -959,6 +1155,13 @@ def handle_mock_seed(ctx):
         # a test that wants "attention but no approval" keeps its choice.
         if body.get("state") is None:
             record["state"] = "attention"
+    if force_approval is not None:
+        # On the session, not on the approval: this is what makes a *future* send
+        # produce an approval (see `handle_send`). Recorded even when a pending
+        # approval is being seeded now, because a test that resolves one and
+        # sends again expects the next turn to gate too.
+        record["meta"] = dict(record.get("meta") or {}, force_approval=force_approval)
+    if pending or force_approval is not None:
         record = state.STORE.save(record)
     return 201, record
 
@@ -1068,9 +1271,9 @@ ROUTES = [
                    note="the transcript detail also carries, with the real `limit` query"),
 
     # -- per-session control, on both surfaces ------------------------------
-    *both_surfaces("POST", "/v1/api/workstreams/{ws_id}/send",
-                   reserved("OTI-5738", "prompt submission"), owner="OTI-5738",
-                   note="appends the user turn and one canned assistant reply"),
+    *both_surfaces("POST", "/v1/api/workstreams/{ws_id}/send", handle_send,
+                   note="appends the user turn and one canned assistant reply, from "
+                        "MOCK_TURNSTONE_REPLY; no model is called"),
     *both_surfaces("DELETE", "/v1/api/workstreams/{ws_id}/send",
                    reserved("", "cancel a queued message"), owner="",
                    note="client has the method; no ticket claims it yet"),
