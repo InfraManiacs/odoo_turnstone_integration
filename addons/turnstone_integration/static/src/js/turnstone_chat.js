@@ -5,7 +5,88 @@ import { registry } from "@web/core/registry";
 import { rpc } from "@web/core/network/rpc";
 import { useService } from "@web/core/utils/hooks";
 import { _t } from "@web/core/l10n/translation";
+import { user } from "@web/core/user";
+import { browser } from "@web/core/browser/browser";
 import { renderMarkdown } from "@turnstone_integration/js/markdown";
+
+/**
+ * Where the chat remembers what this user was looking at.
+ *
+ * Keyed by user id, and the user id is stored inside the value too: Odoo does
+ * not clear localStorage on logout, so on a shared browser the next person to
+ * sign in must not inherit the previous one's conversation. Per-user keys are
+ * what makes that impossible, and the uid in the payload catches a store that
+ * was copied or hand-edited into another user's key.
+ */
+const STORAGE_VERSION = 1;
+
+const storageKey = (uid) =>
+    uid ? `turnstone_integration.chat.v${STORAGE_VERSION}.uid:${uid}` : null;
+
+function positiveInt(value) {
+    const n = Number(value);
+    return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+/** Read the remembered session for `uid`, or null. Never throws. */
+function readStoredSession(uid, storage) {
+    const key = storageKey(uid);
+    if (!key || !storage) {
+        return null;
+    }
+    try {
+        const raw = storage.getItem(key);
+        if (!raw) {
+            return null;
+        }
+        const data = JSON.parse(raw);
+        if (!data || Number(data.uid) !== Number(uid)) {
+            return null;
+        }
+        const sessionId = positiveInt(data.session_id);
+        if (!sessionId) {
+            return null;
+        }
+        return {
+            sessionId,
+            agentId: positiveInt(data.agent_id),
+            agentName: typeof data.agent_name === "string" ? data.agent_name : null,
+            connectionId: positiveInt(data.connection_id),
+        };
+    } catch {
+        // Corrupt JSON, or storage disabled: remembering a session is a
+        // convenience and must never be the reason the chat fails to open.
+        return null;
+    }
+}
+
+/** Write (or, with a null value, clear) the remembered session. Never throws. */
+function writeStoredSession(uid, storage, value) {
+    const key = storageKey(uid);
+    if (!key || !storage) {
+        return;
+    }
+    try {
+        if (!value) {
+            storage.removeItem(key);
+            return;
+        }
+        storage.setItem(
+            key,
+            JSON.stringify({
+                uid,
+                version: STORAGE_VERSION,
+                session_id: value.sessionId,
+                agent_id: value.agentId ?? null,
+                agent_name: value.agentName ?? null,
+                connection_id: value.connectionId ?? null,
+            })
+        );
+    } catch {
+        // Private mode or a full quota. Losing the pointer costs one empty
+        // picker; throwing here would cost the whole chat.
+    }
+}
 
 /**
  * Turnstone chat client.
@@ -57,6 +138,14 @@ export class TurnstoneChat extends Component {
         // changes nothing does not re-parse the whole transcript every 2s.
         this._mdCache = new Map();
 
+        // localStorage is the only place this survives a reload, and it is
+        // namespaced by the signed-in user (see storageKey).
+        this.storage = browser.localStorage;
+        this.uid = user.userId;
+        // Mirror of what was last written, so polling the same session does
+        // not rewrite storage on every tick.
+        this._stored = null;
+
         this.threadRef = useRef("thread");
         this.pollHandle = null;
         this.pollInterval = 2000;   // while a turn is in flight
@@ -86,9 +175,15 @@ export class TurnstoneChat extends Component {
             // Keep the sidebar live even before a session is opened, so a job
             // that starts elsewhere shows up without a manual reload.
             this.maybePoll();
+            // An explicit request wins (the Sessions list, an agent form): the
+            // user is jumping somewhere on purpose. Otherwise reopen what this
+            // user was last looking at, so Agent Chat does not greet them with
+            // an empty screen and a pile of identically named rows.
             const requested = this.props.action?.params?.session_id;
             if (requested) {
                 await this.openSession(requested);
+            } else {
+                await this.restoreSession();
             }
         });
 
@@ -147,19 +242,132 @@ export class TurnstoneChat extends Component {
         this.state.loading = false;
     }
 
-    async openSession(sessionId, { push = false } = {}) {
+    async openSession(sessionId, { push = false, silent = false } = {}) {
         if (push && this.state.session && this.state.session.id !== sessionId) {
             this.navStack.push({ id: this.state.session.id, name: this.state.session.name });
         }
         this.stopPolling();
         const res = await rpc("/turnstone/session/get", { session_id: sessionId, sync: true });
         if (res.error) {
-            return this.fail(res.error);
+            if (silent) {
+                // A restore the user did not ask for must not toast: the
+                // caller decides what to do next.
+                return false;
+            }
+            this.fail(res.error);
+            return false;
         }
         this.state.session = res.session;
         this.loadChildren();
         await this.loadAttachments();
         this.maybePoll();
+        this.rememberSession();
+        return true;
+    }
+
+    // -- what this browser remembers --------------------------------------
+
+    /**
+     * Remember the open session, so reopening Agent Chat (a reload, or the
+     * menu) lands on the same conversation instead of a blank screen.
+     *
+     * The configured agent is stored next to the session because it is the
+     * fallback key: every session of one agent is filed under that agent's
+     * name (see `session_new_from_agent`), so once the stored row is gone the
+     * conversation the user meant is the newest session of that same agent.
+     */
+    rememberSession() {
+        const s = this.state.session;
+        if (!s) {
+            return;
+        }
+        const stored = {
+            sessionId: s.id,
+            agentId: positiveInt(s.agent_id),
+            agentName: s.agent_name || null,
+            connectionId: positiveInt(s.connection_id),
+        };
+        const previous = this._stored;
+        if (
+            previous &&
+            previous.sessionId === stored.sessionId &&
+            previous.agentId === stored.agentId &&
+            previous.agentName === stored.agentName &&
+            previous.connectionId === stored.connectionId
+        ) {
+            return; // polling this same session again: nothing to write
+        }
+        this._stored = stored;
+        writeStoredSession(this.uid, this.storage, stored);
+    }
+
+    /** Forget the remembered session — there is no longer one to reopen. */
+    forgetSession() {
+        this._stored = null;
+        writeStoredSession(this.uid, this.storage, null);
+    }
+
+    /**
+     * Reopen what this user was last looking at, on mount.
+     *
+     * Resolution order, worst case last:
+     *   1. the stored session, if the server still has it (a closed session
+     *      too — it keeps its transcript, it is only hidden from the sidebar);
+     *   2. the newest listed session with the remembered agent;
+     *   3. the newest listed session at all;
+     *   4. the empty state.
+     *
+     * The stored id is dropped in favour of whatever step 2 finds, so the next
+     * reload starts from there. Nothing on this path toasts or reports an
+     * error: a stored id that no longer exists is expected (the row was
+     * deleted, or the server's mirror was rebuilt), not something the user has
+     * to dismiss before they can chat. A transient failure lands them on the
+     * newest session of the same agent rather than an empty screen, which is
+     * the better of the two — the pointer is a convenience, not data.
+     */
+    async restoreSession() {
+        if (this.state.error) {
+            return; // bootstrap already failed and said so; do not pile on
+        }
+        const stored = readStoredSession(this.uid, this.storage);
+        if (!stored) {
+            return;
+        }
+        this._stored = stored;
+        if (await this.openSession(stored.sessionId, { silent: true })) {
+            return;
+        }
+        const fallback = this.fallbackSession(stored);
+        if (!fallback) {
+            this.forgetSession();
+            return;
+        }
+        // Opening the fallback remembers it, replacing the pointer that failed.
+        if (!(await this.openSession(fallback.id, { silent: true }))) {
+            this.forgetSession();
+        }
+    }
+
+    /**
+     * The session to reopen when the remembered one is gone.
+     *
+     * Candidates come only from this user's listing, which the server already
+     * limits by record rules: nothing here can reach another user's session.
+     * Subagents are skipped — the row nested under its parent is not what
+     * "reopen my chat" means — and a session with a workstream beats a draft,
+     * because a draft has no conversation to restore.
+     */
+    fallbackSession(stored) {
+        const rows = (this.state.sessions || []).filter((s) => !s.parent_ws_id);
+        const named = stored.agentName || stored.agentId
+            ? rows.filter(
+                  (s) =>
+                      (stored.agentId && s.agent_id === stored.agentId) ||
+                      (stored.agentName && s.name === stored.agentName)
+              )
+            : [];
+        const pool = named.length ? named : rows;
+        return pool.find((s) => s.ws_id) || pool[0] || null;
     }
 
     /**
@@ -223,9 +431,12 @@ export class TurnstoneChat extends Component {
             return this.maybePoll();
         }
         if (!this.state.session) {
-            // No session open: still keep the sidebar current, so work started
+            // No session open: keep the sidebar current, so work started
             // elsewhere (a schedule, another tab) appears on its own.
             await this.refreshSidebar();
+            // The remembered session is usually already open. When it is not,
+            // it is because a restore found nothing and the empty state was
+            // shown deliberately — so do not keep retrying it on every tick.
             return this.maybePoll();
         }
         if (this.inFlight) {
@@ -251,6 +462,7 @@ export class TurnstoneChat extends Component {
             this.consecutiveFailures = 0;
             this.state.session = res.session;
             this.loadChildren();
+            this.rememberSession();
             await this.refreshSidebar();
         } finally {
             this.inFlight = false;
@@ -453,6 +665,7 @@ export class TurnstoneChat extends Component {
         this.loadChildren();
         await this.loadAttachments();
         this.maybePoll();
+        this.rememberSession();
     }
 
     async loadAttachments() {
@@ -532,6 +745,7 @@ export class TurnstoneChat extends Component {
         this.state.sessions = res.sessions || this.state.sessions;
         this.state.showNewForm = false;
         this.state.newSession.name = "";
+        this.rememberSession();
     }
 
     async send() {
@@ -552,6 +766,7 @@ export class TurnstoneChat extends Component {
         }
         this.state.session = res.session;
         this.state.sessions = res.sessions || this.state.sessions;
+        this.rememberSession();
         this.maybePoll();
     }
 
@@ -593,6 +808,11 @@ export class TurnstoneChat extends Component {
         });
     }
 
+    /**
+     * Close the conversation. It stays in the sessions list (closed sessions
+     * are filtered out of the sidebar only), so this is not "start the next
+     * one": nothing is left open, and nothing should be reopened on reload.
+     */
     async closeSession() {
         await this.withBusy("close", async () => {
         const res = await rpc("/turnstone/session/close", {
@@ -604,6 +824,7 @@ export class TurnstoneChat extends Component {
         this.state.session = null;
         this.state.sessions = res.sessions || [];
         this.stopPolling();
+        this.forgetSession();
         });
     }
 
@@ -652,6 +873,7 @@ export class TurnstoneChat extends Component {
         this.state.adoptWsId = "";
         this.loadChildren();
         this.maybePoll();
+        this.rememberSession();
     }
 
     /** Open a subagent: adopt it if Odoo has never seen it, else just switch. */

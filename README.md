@@ -38,6 +38,10 @@ asking Turnstone over its HTTP API.
 - **File attachments** — images, PDF and text/CSV/JSON, on coordinator sessions.
 - **Multiple servers** — connect to more than one Turnstone, with per-connection
   group restrictions.
+- **Reopens where you left off** — Agent Chat reopens the session you were last
+  looking at instead of a blank screen, and falls back to your newest session
+  with the same agent if that one is gone. Remembered per Odoo user, in the
+  browser only; logging out or switching user never carries it across.
 
 ## Skills and personas are picked, not typed
 
@@ -203,6 +207,33 @@ a session it cannot serve) all raise before anything is written, so the chat
 shows an error and the transcript stays exactly as it was. The header and the
 transcript are applied together in one savepoint, so a failure part-way cannot
 leave half a transcript.
+
+**The chat reopens the last session, and remembers it per user.** Every session
+of one configured agent is filed under exactly that agent's name
+(`session_new_from_agent`), so a fresh Agent Chat used to open on a screen with
+five identically named rows and nothing selected. The client now keeps a
+pointer in `localStorage` under
+`turnstone_integration.chat.v1.uid:<odoo user id>` — the session id, plus its
+agent id/name and connection so a fallback can find "the newest session of that
+agent". The rules that make it safe:
+
+- **Per user, checked twice.** Odoo does not clear `localStorage` on logout, so
+the key is namespaced by user id *and* the stored payload repeats the uid and
+is ignored when it does not match. A second user on a shared browser never
+sees the first one's conversation, and their pointer is left untouched.
+- **A stale pointer is not an error.** When the stored row is gone (deleted,
+or the server's mirror rebuilt) the client drops it, reopens the newest session
+of the remembered agent (then newest session at all, then the empty state) and
+shows no toast: the user did not ask for this restore, so a failure of it is
+not something to dismiss.
+- **An explicit request wins.** `params.session_id` — the Sessions list's Open
+button, an agent's Start, a linked record — opens that session and replaces the
+pointer. Restoring only happens on a bare mount where nothing was requested.
+- **Closing forgets.** Close leaves the pointer cleared rather than pointing at
+a closed session, so a reload lands on the picker, not a conversation that
+cannot be continued.
+- Nothing here changes polling cadence: the pointer is written when the open
+session changes, not on every tick, and `pollDelay()` is untouched.
 
 **Coordinators and interactive sessions are driven through different APIs.**
 A coordinator is hosted by the console (`/workstreams/{id}/...`); an interactive
