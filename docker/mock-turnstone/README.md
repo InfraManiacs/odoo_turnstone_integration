@@ -77,6 +77,7 @@ All read from the environment **at startup**, so restart after changing one.
 | `MOCK_TURNSTONE_HEALTH_PUBLIC` | `0` | `1` lets `GET /health` skip the token check, for a container `HEALTHCHECK`. Default keeps health token-protected like everything else |
 | `MOCK_TURNSTONE_PERMISSIONS` | 7 mock scopes | comma-separated permissions reported by `/v1/api/auth/whoami`; set it to pretend the token is weaker than it is |
 | `MOCK_TURNSTONE_LOG_LEVEL` | `INFO` | one line per request goes to stderr at `INFO`; `WARNING` silences the access log, `DEBUG` adds BaseHTTPRequestHandler's own line |
+| `MOCK_TURNSTONE_REPLY` | `state.DEFAULT_REPLY` | the assistant text **every** prompt gets, verbatim. This server runs no model, so a reply a test can predict is the only honest one. Set it to prove a transcript assertion is reading configuration and not a constant buried in a handler; a blank value is refused at startup. Two in-process servers can answer differently, which is how the "it really is configuration" claim is testable |
 
 The token is never printed and never logged. Point an Odoo `turnstone.connection`
 at this server with base URL `http://mock-turnstone:8099` (compose) or
@@ -110,9 +111,10 @@ exactly as the handler wrote them: a top-level JSON list stays a list, because
 
 ## Implemented paths
 
-Route table as of OTI-5736: **19 of 37 declared paths do something, the rest
-answer 501 naming their owner** (14 unclaimed, 2 owned by OTI-5738 in this
-story). The live table is always available from the running process:
+Route table as of OTI-5738: **21 of 37 declared paths do something, the rest
+answer 501 naming their owner** (12 unclaimed; no ticket in this story any
+longer owns a stub). The live table is always available from the running
+process:
 
 ```sh
 curl -H 'Authorization: Bearer mock-token' http://localhost:8099/v1/api/admin/mock/routes
@@ -135,6 +137,7 @@ curl -H 'Authorization: Bearer mock-token' http://localhost:8099/v1/api/admin/mo
 | GET | `/v1/api/workstreams/{ws_id}/history` | **A coordinator's transcript**, oldest first: `ws_id`, `messages`, and `cursor`/`handoff_token` (both `null`; they belong to the SSE handoff this mock has none of). `limit` bounds the tail (max 500) |
 | GET | `/v1/api/route/workstreams/{ws_id}/history` | The same transcript for an **interactive** session, through its own surface. Identical body |
 | POST | `/v1/api/workstreams/{ws_id}/rewind` (+ `/route/` twin) | Drop the last N **user turns** and everything answering them: `{"turns": N}`, clamped to what the session has. Answers `{"status":"ok","dropped":…,"remaining":…}` |
+| POST | `/v1/api/workstreams/{ws_id}/send` (+ `/route/` twin) | **A prompt, and its canned reply.** Body `{"message": …}` (required; optional `client_send_id`, `attachment_ids`). Appends **exactly two** rows — the user turn and one assistant turn from `MOCK_TURNSTONE_REPLY` — moves the token counter, and leaves the session `idle`. No model is called and nothing is timed. Answers 1.8.3's `SendResponse` (`status: "ok"`), plus the two appended rows and the post-send counters. A closed session is `409`; a session seeded with `force_approval` parks in `attention` instead of returning to idle |
 | POST | `/v1/api/admin/mock/reset` | **mock only.** Back to the post-startup shape: no workstreams, ids restart at `ws-000001`, catalogue re-seeded, request log cleared |
 | GET | `/v1/api/admin/mock/state` | **mock only.** Full state snapshot for assertions |
 | POST | `/v1/api/admin/mock/seed` | **mock only.** Create a workstream directly, with any state, transcript, counters and a pinned `ws_id`. `append: true` instead plants `messages` onto an existing `ws_id` |
@@ -148,7 +151,6 @@ reshaping URLs. The `owner` in the 501 body is the ticket.
 
 | Method | Path | Owner |
 |---|---|---|
-| POST | `/v1/api/workstreams/{ws_id}/send` and its `/route/` twin | OTI-5738 — prompt post and canned reply |
 | GET | `/v1/api/admin/schedules` | unclaimed — Schedules screen, no ticket yet |
 | GET | `/v1/api/admin/schedules/{task_id}/runs` | unclaimed |
 | DELETE | `/v1/api/workstreams/{ws_id}/send` (+ `/route/`) | unclaimed — cancel a queued message |
@@ -284,9 +286,82 @@ produces one. Everything the endpoint cannot act on (`client_type`,
 "what did Odoo ask for" is answerable without pretending the mock honours it.
 
 `initial_message` becomes the first **user** turn of the stored transcript, and
-the state stays `idle`: this server runs no model, so it will not claim to be
-`thinking` about a reply that is never coming. The assistant side is OTI-5738's
-canned reply.
+this server answers it with the same canned reply a `send` does — because the
+addon's *first* message goes through this endpoint, not through `/send`
+(`action_send` → `_ensure_started(first_message=…)`). A create with no reply
+would leave every session's opening prompt unanswered while every later message
+got one. The state stays `idle`: there is nothing to wait for, so it will not
+claim to be `thinking` about a reply that already arrived.
+
+## Prompts, replies, and the approval switch (OTI-5738)
+
+```sh
+T='Authorization: Bearer mock-token'; B=http://localhost:8099
+
+# Create the session first (an interactive one, so it is read on the /route/ path)
+curl -X POST -H "$T" $B/v1/api/route/workstreams/new -d '{"name":"Prompted"}'
+# {"ws_id":"ws-000001",...}
+
+# A prompt. The reply is the SAME every time: this server calls no model.
+curl -X POST -H "$T" $B/v1/api/route/workstreams/ws-000001/send \
+  -d '{"message":"what changed today?"}'
+# {"status":"ok","deferred":false,"ws_id":"ws-000001",
+#  "turns":[{"role":"user","content":"what changed today?",...},
+#            {"role":"assistant","content":"<MOCK_TURNSTONE_REPLY>",...}],
+#  "message_count":2,"tokens":24,"tool_calls":0,"state":"idle",
+#  "pending_approval_details":[]}
+```
+
+A send appends **exactly two** rows — the user turn and one assistant turn read
+from `MOCK_TURNSTONE_REPLY` — and moves `tokens` by a deterministic estimate of
+both (four characters per token, never zero). It does **not** move `tool_calls`:
+this server executes no tool, and a counter that went up would be the mock
+claiming work it did not do. The session is back to `idle` in the same locked
+write, so a chat that polls `detail` right after a send sees a finished exchange
+rather than a spinner. `state.send_turn()` does both rows, the counters and the
+state under one lock: a poll can never catch a user row whose reply and token
+count have not arrived, which is a half-turn the real server does not expose.
+
+`attachment_ids` is accepted and answered as **dropped**
+(`dropped_attachment_ids`), because no upload path exists in this mock yet — no
+id a caller can name is one this server holds, and pretending to attach it would
+be the harness lying about a turn.
+
+### Forcing an approval, for approval-path tests
+
+An approval is something this server will never produce on its own (there is no
+tool to gate), so it has to be arranged. Put a session into approval mode, then
+send:
+
+```sh
+# Either at seed time...
+curl -X POST -H "$T" $B/v1/api/admin/mock/seed \
+  -d '{"kind":"interactive","ws_id":"ws-approval","force_approval":true}'
+
+# ...or on a session that already exists
+curl -X POST -H "$T" $B/v1/api/admin/mock/seed \
+  -d '{"append":true,"ws_id":"ws-approval","force_approval":true}'
+
+curl -X POST -H "$T" $B/v1/api/route/workstreams/ws-approval/send \
+  -d '{"message":"delete that partner"}'
+curl -H "$T" $B/v1/api/cluster/ws/ws-approval/detail
+# live.state == "attention"
+# live.pending_approval_details == [{"cycle_id":"cycle-mock-1",
+#   "items":[{"func_name":"mock_write",...}]}]
+```
+
+The switch is on the **session** (recorded under `meta.force_approval`), not on
+the send body, deliberately: adding a field to `POST .../send` would make a body
+the real server rejects, so a test could pass against an API Turnstone does not
+have. In-process, the same thing is `state.STORE.force_approval(ws_id)` and
+`state.STORE.clear_approval(ws_id)`; `state.STORE.send_turn(ws_id, text,
+force_approval=True)` gates a single turn without changing the session.
+
+The forced payload is shaped like the real `PendingApprovalDetail` from 1.8.3's
+spec — an envelope per cycle with the tool call nested under `items[]` — because
+`turnstone_session._flatten_approvals` reads `cycle_id` from the envelope and
+`func_name`/`preview` from the item. A flat list would open the approval panel
+with no tool name in it.
 
 ## Listing and detail
 
@@ -370,11 +445,13 @@ curl -H "$T" "$B/v1/api/admin/mock/requests?path_prefix=/v1/api/route&method=POS
 `seed` accepts, all optional except `kind`: `kind`, `name`, `title`, `state`,
 `skill`, `persona`, `model_alias`, `parent_ws_id`, `ws_id`, `tokens`,
 `tool_calls`, `context_ratio`, `activity`, `activity_state`, `messages`,
-`pending_approval_details`, `meta`. A seeded `pending_approval_details` defaults
-the state to `attention` unless you pass an explicit `state`. A pinned `ws_id`
-that is already taken answers **409** rather than replacing the existing
-workstream — and the sequential generator skips ids you have pinned, so a later
-create cannot collide with one.
+`pending_approval_details`, `meta`, `force_approval`. A seeded
+`pending_approval_details` defaults the state to `attention` unless you pass an
+explicit `state`. `force_approval: true` makes every **later** send park the
+session in `attention` with a pending approval cycle (see "Forcing an
+approval"). A pinned `ws_id` that is already taken answers **409** rather than
+replacing the existing workstream — and the sequential generator skips ids you
+have pinned, so a later create cannot collide with one.
 
 The request log is capped at 500 entries (the counter keeps counting past the
 cap), because a chat polls every couple of seconds for as long as a test runs.
@@ -383,8 +460,10 @@ Bodies are truncated at 2000 characters. The bearer token is never recorded.
 ## What this server deliberately does not do
 
 * **No agent behaviour.** No model call, no tool execution, no delegation, no
-  timing. A reply is a fixed string (OTI-5738, from the environment), which is
-  the point: a test asserting on a transcript needs a reply it can predict.
+  timing. A reply is a fixed string (OTI-5738, from `MOCK_TURNSTONE_REPLY`),
+  which is the point: a test asserting on a transcript needs a reply it can
+  predict. A send therefore never moves `tool_calls`, and nothing here ever
+  produces an approval unless `force_approval` asked for one.
 * **No persistence.** State dies with the process, by design — a test that
   leaks state into the next one is a test that fails in a month for no reason.
   Nothing is written to disk anywhere.
@@ -414,7 +493,9 @@ This ticket (OTI-5733) is the core: bind/auth/404/route table. Then:
   **Done**: see "Transcripts" above. `rewind` came with it, because it is the
   only way a transcript gets shorter.
 * **OTI-5738** — prompt post appends the user turn plus one canned assistant
-  turn and moves the token counters.
+  turn and moves the token counters. **Done**: see "Prompts, replies, and the
+  approval switch" above. It also had to answer a create's `initial_message`,
+  because the addon's first message goes through create rather than send.
 * **OTI-5740** — switchable failure modes (500, slow, malformed JSON, empty
   history, `{"error": "coordinator not found"}`) so error handling can be tested
   on purpose.
