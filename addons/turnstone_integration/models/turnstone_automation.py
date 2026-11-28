@@ -32,12 +32,19 @@ is the one place that turns a template plus a record into that body.
 """
 
 import difflib
+import hashlib
+import hmac
+import json
 import logging
 import re
+import secrets
+import time
 from datetime import timedelta
 
+from psycopg2 import errors as psycopg2_errors
+
 from odoo import _, api, fields, models
-from odoo.exceptions import UserError, ValidationError
+from odoo.exceptions import ConcurrencyError, UserError, ValidationError
 from odoo.fields import Domain
 from odoo.tools import html2plaintext
 from odoo.tools.safe_eval import safe_eval
@@ -78,6 +85,86 @@ TARGET_MODEL_REQUIRED_FOR = (
     "record_create", "record_write", "record_create_or_write",
     "chatter_message", "schedule",
 )
+
+# ---------------------------------------------------------------------------
+# Inbound webhooks (#5755)
+# ---------------------------------------------------------------------------
+
+#: `ir.config_parameter` key holding the ONE shared secret every inbound
+#: webhook is signed with. One secret rather than one per rule: it is a single
+#: value to set, a single value to rotate, and it lives where every other
+#: deployment secret in Odoo lives, so it can be pinned by a config file or an
+#: environment instead of by hand in a UI.
+WEBHOOK_SECRET_PARAM = "turnstone_integration.webhook_secret"
+
+#: How far a delivery's timestamp may be from ours before it is refused. This is
+#: not the replay defence on its own (the event id is: a replayed delivery names
+#: an event that already has a run), it is what bounds how long a captured
+#: request stays worth replaying at all — including one whose run has since
+#: been deleted.
+WEBHOOK_MAX_SKEW_SECONDS = 300
+
+#: The header a sender may use to name the event. A body field is accepted too
+#: (`event_id`, then `delivery_id`): see `_webhook_event_id()`.
+WEBHOOK_EVENT_HEADER = "X-Turnstone-Event-Id"
+WEBHOOK_TIMESTAMP_HEADER = "X-Turnstone-Timestamp"
+WEBHOOK_SIGNATURE_HEADER = "X-Turnstone-Signature"
+
+#: How much of the payload reaches the agent. A webhook is external input: one
+#: delivery must not be able to spend a megabyte of the agent's context.
+WEBHOOK_MAX_PAYLOAD_CHARS = 20_000
+
+#: `idempotency_key` and `dedupe_token` are `Char`, and an event id is chosen by
+#: a third party. Bounded so a delivery cannot fail on a database limit.
+WEBHOOK_MAX_KEY_CHARS = 255
+
+
+#: The errors that mean "another transaction won this write". Odoo re-runs a
+#: whole handler on these, which is exactly what a launch must not do (the
+#: remote call already happened), so the few writes that can lose this race drop
+#: the value instead of raising. Same tuple as `turnstone.session`'s, kept local
+#: because that module's names its own concern.
+RETRYABLE_WRITE_ERRORS = (
+    psycopg2_errors.SerializationFailure,
+    psycopg2_errors.LockNotAvailable,
+    psycopg2_errors.DeadlockDetected,
+    ConcurrencyError,
+)
+
+#: The database name of `turnstone.automation.run`'s `(automation_id,
+#: idempotency_key)` unique constraint — `_run_key_uniq` on that model. Written
+#: out here because this module is what has to tell "this event is already
+#: recorded" apart from any other unique violation, and at REPEATABLE READ the
+#: constraint's refusal is the *only* evidence available: a transaction whose
+#: snapshot predates the winner's commit cannot see the winning row at all (see
+#: `_deliver_webhook_once`). Odoo derives the name from the model table and the
+#: constraint attribute, and `tests/` asserts it stays this value.
+RUN_KEY_CONSTRAINT = "turnstone_automation_run_run_key_uniq"
+
+#: Advisory-lock namespace for "one in-flight delivery per rule". Advisory
+#: locks are keyed by two int4s, so the first is this module's own constant and
+#: the second is the rule id: nothing else in the database can collide with it,
+#: and it needs no table. See `_webhook_lock()`.
+WEBHOOK_LOCK_NAMESPACE = 0x54535742  # "TSWB", well inside int4
+
+
+class WebhookRefused(Exception):
+    """A delivery the webhook route must refuse.
+
+    Carries the HTTP status and a short machine-readable code, and nothing else.
+    The code is the *whole* of what a sender is told: no rule name, no model, no
+    field, no server message. Those live on the run record, which is where
+    somebody with access to this database can read them, and nowhere a third
+    party can.
+
+    Not a `UserError`: Odoo's own dispatcher would turn that into a 422 with a
+    serialized exception, and an external sender must never see a traceback.
+    """
+
+    def __init__(self, status, code):
+        self.status = status
+        self.code = code
+        super().__init__(code)
 
 
 class TurnstoneAutomation(models.Model):
@@ -162,6 +249,19 @@ class TurnstoneAutomation(models.Model):
              "loop.",
     )
 
+    # -- inbound webhook (#5755) -------------------------------------------
+    webhook_key = fields.Char(
+        string="Webhook Key", copy=False, index=True, readonly=True,
+        help="The last path segment of this rule's webhook URL. Generated when "
+             "the rule is saved with the Inbound webhook trigger, and never "
+             "reused: rotating it (with the button on the form) is how a URL is "
+             "withdrawn, because the old one stops resolving immediately.\n\n"
+             "It is not the rule's id on purpose — ids count 1, 2, 3 and can be "
+             "guessed, and this value is half of what a caller needs to reach "
+             "the rule. It is not a secret either: the signature below is what "
+             "authenticates a delivery, and reading this is a manager's right.",
+    )
+
     # -- what it asks -------------------------------------------------------
     prompt_template = fields.Text(
         string="Prompt", required=True,
@@ -234,6 +334,80 @@ class TurnstoneAutomation(models.Model):
         "unique(name, company_id)",
         "An automation with that name already exists for this company.",
     )
+    # Two rules with one webhook URL would make "which rule does this delivery
+    # wake" depend on row order. The empty values coexist: Postgres treats
+    # NULLs as distinct in a unique index, which is exactly right for the rules
+    # that have no webhook.
+    _webhook_key_uniq = models.Constraint(
+        "unique(webhook_key)",
+        "Another automation already uses that webhook key. Give this rule its "
+        "own (the button on the form generates one).",
+    )
+
+    @api.model_create_multi
+    def create(self, vals_list):
+        """Give every webhook rule its key before it is inserted.
+
+        In `create()` rather than in a default, because the key has to exist for
+        the row that is being written: a delivery arriving in the same instant
+        as the save must find a rule, and a key filled in by a later write would
+        leave a window where the rule exists with no URL at all.
+        """
+        for vals in vals_list:
+            if vals.get("trigger_type") == "webhook" and not vals.get("webhook_key"):
+                vals["webhook_key"] = self._generate_webhook_key()
+        return super().create(vals_list)
+
+    def write(self, vals):
+        """A rule switched to Inbound webhook gets a key, in the same write.
+
+        Without this, switching the trigger on an existing rule would leave it
+        with no URL until somebody hit Rotate — a rule that looks configured and
+        silently accepts nothing.
+
+        Per record, because the key is a different value for each: a shared one
+        would trip the unique constraint, and a delivery naming it could not say
+        which rule it meant.
+        """
+        if vals.get("trigger_type") == "webhook" and not vals.get("webhook_key"):
+            needing = self.filtered(lambda rec: not rec.webhook_key)
+            for rec in needing:
+                super(TurnstoneAutomation, rec).write(
+                    dict(vals, webhook_key=self._generate_webhook_key())
+                )
+            rest = self - needing
+            if rest:
+                return super(TurnstoneAutomation, rest).write(vals)
+            return True
+        return super().write(vals)
+
+    @api.model
+    def _generate_webhook_key(self):
+        """A fresh, unguessable webhook path segment.
+
+        32 hex characters, the same shape as the idempotency keys this module
+        already generates: one idea of "unguessable token" in the codebase
+        rather than two. `secrets` rather than `random`, because this value is
+        half of what reaching a rule requires and `random` is predictable from a
+        few outputs.
+        """
+        return secrets.token_hex(16)
+
+    def action_rotate_webhook_key(self):
+        """Replace this rule's webhook URL with a new one. Old URL stops working."""
+        self.ensure_one()
+        self.sudo().write({"webhook_key": self._generate_webhook_key()})
+        return True
+
+    @api.constrains("trigger_type", "webhook_key")
+    def _check_webhook_key(self):
+        for rec in self:
+            if rec.trigger_type == "webhook" and not rec.webhook_key:
+                raise ValidationError(_(
+                    "%(name)s uses the Inbound webhook trigger but has no webhook "
+                    "key, so it would have no URL to receive anything on. Save "
+                    "it again, or press Rotate Webhook Key.",
+                ) % {"name": rec.name or _("this rule")})
 
     # -- validation ---------------------------------------------------------
 
@@ -670,12 +844,38 @@ class TurnstoneAutomation(models.Model):
 
         `sudo()` so the counter still moves when the run itself is attributed to
         an ordinary user: it is bookkeeping about the rule, not about them.
+
+        **Never raises (OTI-5755).** This writes the rule row, and it is the one
+        row every concurrent trigger of the same rule shares: at REPEATABLE READ
+        two launches incrementing `run_count` at once do not serialise, and the
+        loser gets `SerializationFailure` — after the remote call may already
+        have happened, which turns a counter into a lost event. Measured before
+        this guard existed: 8 concurrent webhook deliveries to one rule lost one
+        of them to a 500 raised here. The counter is a convenience; the run rows
+        are the record, and `run_ids` still answers "how many times did this
+        fire" exactly.
+
+        So the write runs in a savepoint and a lost race is dropped, the same
+        trade `turnstone.session._no_replay()` makes for the same reason.
         """
         self.ensure_one()
-        self.sudo().write({
-            "run_count": (self.run_count or 0) + 1,
-            "last_run_at": when or fields.Datetime.now(),
-        })
+        try:
+            with self.env.cr.savepoint():
+                self.env.cr.execute(
+                    """UPDATE turnstone_automation
+                          SET run_count = COALESCE(run_count, 0) + 1,
+                              last_run_at = %s
+                        WHERE id = %s""",
+                    (when or fields.Datetime.now(), self.id),
+                )
+                # The ORM's cache holds the pre-update value, and any reader in
+                # this transaction would otherwise see the old count.
+                self.invalidate_recordset(["run_count", "last_run_at"])
+        except RETRYABLE_WRITE_ERRORS as exc:
+            _logger.info(
+                "Automation %s: run counter lost a write race (%s); the run itself "
+                "is recorded and the counter is advisory.", self.name, exc,
+            )
         return True
 
     # -- launching ----------------------------------------------------------
@@ -995,3 +1195,333 @@ class TurnstoneAutomation(models.Model):
         self.ensure_one()
         connection = self.sudo().agent_id.connection_id
         return [token for token in (connection.sudo().api_token,) if token] if connection else []
+
+    # -- inbound webhooks (#5755) ------------------------------------------
+
+    @api.model
+    def _webhook_secret(self):
+        """The deployment's shared webhook secret, or `None` when unset.
+
+        `ir.config_parameter` rather than a field on a rule, so one value covers
+        every rule and lives where the rest of the deployment's secrets are
+        (a config file, an environment variable, a secret manager injecting a
+        parameter). Read under `sudo()`: the parameter table is readable by
+        ordinary users in Odoo (it holds no ACL secret of its own), so this
+        would work either way, but the read is not the caller's business.
+        """
+        value = self.env["ir.config_parameter"].sudo().get_param(WEBHOOK_SECRET_PARAM)
+        return (value or "").strip() or None
+
+    @api.model
+    def _webhook_signature(self, timestamp, body):
+        """The signature a sender must have presented for this exact delivery.
+
+        Over `"<timestamp>.<raw body>"`, not over the body alone: the timestamp
+        has to be signed too, or a captured request could be re-dated to escape
+        the skew window and be replayed forever. The body is the **raw bytes**:
+        re-serialising parsed JSON would make the check depend on this module's
+        choice of separators and key order, and a sender that signed what it
+        actually sent would fail.
+
+        `@api.model` and no `ensure_one()`: the secret is one deployment-wide
+        value and the signature is checked *before* a rule is resolved, which is
+        the whole reason an unknown key and a bad signature answer the same.
+        """
+        secret = self._webhook_secret()
+        if not secret:
+            # Nothing can be verified. This is raised, not returned as a
+            # "never matches" value: a deployment where webhooks silently never
+            # authenticate is worse than one that says so.
+            raise UserError(_(
+                "Inbound webhooks are not configured on this database: set the "
+                "system parameter %s to the shared signing secret.",
+            ) % WEBHOOK_SECRET_PARAM)
+        mac = hmac.new(
+            secret.encode(),
+            timestamp.encode() + b"." + body,
+            hashlib.sha256,
+        )
+        return "sha256=" + mac.hexdigest()
+
+    @api.model
+    def _webhook_check_signature(self, signature, timestamp, body):
+        """Raise `WebhookRefused` unless this delivery is authentic and fresh.
+
+        Both halves are the sender's to get right, and neither answer says which
+        one failed: a bad signature and a stale timestamp are both 401 with one
+        body, so a prober learns nothing to iterate on.
+        """
+        if not signature or not timestamp:
+            raise WebhookRefused(401, "unauthorized")
+        # A timestamp that is not a number is simply a request that was not
+        # signed the way this contract says; there is nothing to compare.
+        try:
+            sent_at = int(timestamp)
+        except (TypeError, ValueError):
+            raise WebhookRefused(401, "unauthorized") from None
+        if abs(time.time() - sent_at) > WEBHOOK_MAX_SKEW_SECONDS:
+            raise WebhookRefused(401, "unauthorized")
+        expected = self._webhook_signature(timestamp, body)
+        # `compare_digest`, not `==`: a byte-by-byte comparison leaks the length
+        # of the matching prefix to anyone who can time the response, and one
+        # character at a time is enough to forge a signature offline. It also
+        # refuses a non-ASCII header outright (TypeError), which is the right
+        # answer for a header this contract says is hex.
+        try:
+            matches = hmac.compare_digest(expected, signature)
+        except TypeError:
+            matches = False
+        if not matches:
+            raise WebhookRefused(401, "unauthorized")
+        return True
+
+    @api.model
+    def _find_by_webhook_key(self, webhook_key):
+        """The rule this URL names, or an empty recordset.
+
+        Archived rules are excluded: archiving a rule is how it is retired, and
+        a retired rule's URL must stop working without anyone having to remember
+        to rotate a key. Any trigger type is *not* filtered here — a URL that
+        reaches a rule whose trigger has since changed still owes the sender an
+        answer, and `_webhook_accepts` gives it one.
+        """
+        key = (webhook_key or "").strip()
+        if not key:
+            return self.browse()
+        return self.sudo().search([
+            ("webhook_key", "=", key),
+            ("active", "=", True),
+        ], limit=1)
+
+    @api.model
+    def _webhook_event_id(self, headers, payload):
+        """The event id this delivery is keyed on. Raises when there is none.
+
+        The header is checked first because a proxy may rewrite the body and
+        not the headers, and a sender's delivery id survives both. The body field
+        is the fallback for a sender that signs nothing it does not also have to
+        sign — and `delivery_id` is accepted because that is what the webhook
+        providers actually call it.
+        """
+        for candidate in (
+            headers.get(WEBHOOK_EVENT_HEADER),
+            payload.get("event_id") if isinstance(payload, dict) else None,
+            payload.get("delivery_id") if isinstance(payload, dict) else None,
+        ):
+            text = str(candidate or "").strip()
+            if text:
+                if len(text) > WEBHOOK_MAX_KEY_CHARS:
+                    raise WebhookRefused(400, "invalid_event_id")
+                return text
+        raise WebhookRefused(400, "missing_event_id")
+
+    @api.model
+    def _webhook_dedupe_token(self, payload):
+        """What this delivery is *about*, for the rule's repeat window, or `None`.
+
+        The run model refuses to guess ("only the caller knows what 'the same
+        thing' means"), and here the caller is this route — so the sender says: a
+        `dedupe_key` in the body names the object the event is about, the way an
+        `issue.number` would. Without one and with a window configured, the
+        launch fails with the run model's own explanation rather than silently
+        firing every time, which is what a window that never matches would do.
+
+        Bounded like the event id, because it is also a `Char` chosen by a third
+        party.
+        """
+        raw = payload.get("dedupe_key") if isinstance(payload, dict) else None
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        return text[:WEBHOOK_MAX_KEY_CHARS]
+
+    def _webhook_prompt(self, payload):
+        """The message body this delivery sends.
+
+        The rule's prompt template is the instruction, and it leads — except that
+        `{{ }}` placeholders are rendered from the rule, not from the payload: a
+        webhook rule has no target model, so any placeholder would already have
+        been refused when the rule was saved (`_parse_template`).
+
+        The payload follows as a fenced JSON block, so the instruction and the
+        data stay visibly apart. That is a security decision as much as a
+        readability one: an event body is third-party text, and a delivery that
+        could place its own words where the instruction goes would be choosing
+        what the agent (holding a server token) is asked to do. Fenced and after
+        the instruction, it reads as data.
+
+        The fence is made longer than any run of backticks **inside** the payload
+        (CommonMark closes a fence only on a run at least as long), because a
+        payload containing ``` would otherwise end the block early and put the
+        rest of its own text back at instruction level — the exact hole the
+        fence exists to close. `json.dumps` also escapes the payload's newlines
+        and quotes, so what appears between the fences is one escaped string
+        value per line, not re-flowed text.
+        """
+        self.ensure_one()
+        try:
+            rendered = json.dumps(payload, indent=2, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            rendered = repr(payload)
+        if len(rendered) > WEBHOOK_MAX_PAYLOAD_CHARS:
+            rendered = rendered[:WEBHOOK_MAX_PAYLOAD_CHARS] + "\n… [truncated]"
+        longest = max((len(m) for m in re.findall(r"`+", rendered)), default=0)
+        fence = "`" * max(3, longest + 1)
+        return "%s\n\n%sjson\n%s\n%s" % (
+            self._render_prompt(), fence, rendered, fence,
+        )
+
+    def _webhook_lock(self):
+        """A non-blocking, transaction-scoped lock on this rule, or `False`.
+
+        Every delivery to one rule writes the same row: `run_count` and
+        `last_run_at` on the rule itself (`_note_run`). At Odoo's REPEATABLE READ
+        two concurrent deliveries that both bump that counter do not serialise —
+        the second gets `SerializationFailure` on *commit*, after the remote
+        launch has already happened, and the whole request is re-run or lost
+        (measured: 8 concurrent deliveries to one rule produced a 500 and a
+        dropped event before this existed).
+
+        A lock that makes the deliveries queue would serialise on the same row
+        anyway, so this one is *non-blocking*: whoever loses tells the sender
+        "busy, try again" (429) without having written anything, which is the
+        one answer a webhook sender already knows how to handle. That is cheaper
+        and more honest than an internal retry loop around a remote POST.
+
+        Transaction-scoped (`pg_try_advisory_xact_lock`), so it is released by
+        the commit or the rollback and cannot be leaked by a crash — the
+        failure mode of a session-scoped advisory lock.
+        """
+        self.ensure_one()
+        self.env.cr.execute(
+            "SELECT pg_try_advisory_xact_lock(%s, %s)",
+            (WEBHOOK_LOCK_NAMESPACE, self.id),
+        )
+        return bool(self.env.cr.fetchone()[0])
+
+    def _webhook_accepts(self):
+        """Whether this rule can be woken by a delivery, and if not why.
+
+        Checked before any run exists, because these are configuration
+        problems: an archived rule, a trigger somebody changed, or a rule with no
+        agent. The answer is recorded on the run like every other refusal, so
+        the reason is visible to whoever debugs the rule — and *not* to the
+        sender, who is told only that the delivery was accepted.
+        """
+        self.ensure_one()
+        if not self.active:
+            return _("the rule is archived")
+        if self.trigger_type != "webhook":
+            return _("its trigger is no longer Inbound webhook")
+        if not self.agent_id:
+            return _("it has no agent configured")
+        return None
+
+    def _deliver_webhook(self, payload, idempotency_key, dedupe_token=None):
+        """Handle one authenticated delivery. Returns `(run, is_replay)`.
+
+        The two questions a repeat has to answer differently:
+
+        * **The same event twice** — the run's unique `(automation_id,
+          idempotency_key)` is the answer, so the second delivery finds the
+          first run and sends nothing. That is the replay defence; the timestamp
+          window only stops a captured request being worth replaying at all.
+          Reported as a replay, because a sender that gets a success for a
+          re-delivery has no reason to stop re-sending it.
+        * **A different event for the same sender object** — `dedupe_token`,
+          when the rule has a window. Not derived from the payload here: only
+          the rule's author knows what "the same thing" means for their event.
+
+        Launch semantics are the launch service's, unchanged: a run that is
+        `queued`/`running`/`done`/`skipped` is answered with itself, and a run in
+        `failed` is *retried in place* rather than reported as a duplicate — a
+        500 from Turnstone must not become a permanently lost event.
+
+        Raises `WebhookRefused(429, "busy")` when another delivery to this same
+        rule is in flight — see `_webhook_lock()` on why that is refused rather
+        than queued.
+        """
+        self.ensure_one()
+        # The duplicate check happens BEFORE taking the lock: a re-delivery is
+        # answered from a read, and making it wait for (or fail on) a lock held
+        # by an unrelated event would turn a harmless retry into an error.
+        runs = self.env["turnstone.automation.run"].sudo()
+        existing = runs._find_by_key(self, idempotency_key)
+        if existing and existing.state != "failed":
+            # Terminal or in flight. A failed run is the one exception, and the
+            # launch service decides that below.
+            return existing, True
+
+        if not self._webhook_lock():
+            # This rule is already handling a delivery in this instant. Nothing
+            # has been written yet, so the sender's retry is a clean first
+            # attempt — which is exactly why 429 is right here and 202 would not
+            # be.
+            raise WebhookRefused(429, "busy")
+
+        refusal = self._webhook_accepts()
+        if refusal is not None:
+            run, mine = runs._open_for_event(
+                self, idempotency_key, dedupe_token=dedupe_token,
+            )
+            if mine:
+                # `failed` with no attempt counted, which is exactly how the
+                # launch service records "refused before anything was tried".
+                # Not `skipped`: that is terminal, and a rule somebody fixes a
+                # minute later has to be able to answer the sender's retry.
+                run._mark_failed(_(
+                    "The webhook delivery was authenticated but not launched: "
+                    "%s.",
+                ) % refusal)
+            return run, False
+
+        return self._launch_for_record(
+            idempotency_key=idempotency_key,
+            dedupe_token=dedupe_token,
+            prompt=self._webhook_prompt(payload),
+        ), False
+
+    def _deliver_webhook_once(self, payload, idempotency_key, dedupe_token=None):
+        """`_deliver_webhook`, with a lost insert race answered as a replay.
+
+        `_open_for_event()` closes the race between two callers that both find no
+        run — but only for a caller that can **see** the winner. Under REPEATABLE
+        READ, a transaction whose snapshot predates the winner's commit cannot:
+        `_find_by_key()` finds nothing both before and inside the savepoint, and
+        the insert then trips the unique constraint. Postgres's own uniqueness
+        check sees the row even though the snapshot does not. That surfaced as a
+        500, and a 500 to a webhook sender means "retry", for an event that is
+        already recorded — measured with eight simultaneous deliveries of one
+        event.
+
+        So the answer comes from the constraint rather than from a re-read: the
+        run-key unique constraint refusing this insert **is** the statement "this
+        event already has a run", and it is the only thing that can say so when
+        the row is invisible to this transaction. Reported as a replay; nothing
+        was launched by this caller, and the row it lost to is the one that
+        counts.
+
+        Told apart by `constraint_name`, not by catching `UniqueViolation`
+        broadly: the savepoint also covers the session create and the audit row,
+        and a unique violation from *those* is a bug, not a duplicate. Calling it
+        a duplicate would turn a real failure into a cheerful 409.
+        """
+        self.ensure_one()
+        try:
+            with self.env.cr.savepoint():
+                return self._deliver_webhook(
+                    payload, idempotency_key, dedupe_token=dedupe_token,
+                )
+        except psycopg2_errors.UniqueViolation as exc:
+            constraint = getattr(exc.diag, "constraint_name", None)
+            if constraint != RUN_KEY_CONSTRAINT:
+                raise
+            _logger.info(
+                "Automation %s: delivery %s lost the insert race on %s; answered "
+                "as a duplicate (the row is not visible to this transaction's "
+                "snapshot).", self.name, idempotency_key, constraint,
+            )
+            # The row exists but this transaction cannot see it, so there is no
+            # recordset to return. The caller only needs "this is a replay", and
+            # the run it names is unreadable from here by definition.
+            return self.env["turnstone.automation.run"].sudo().browse(), True

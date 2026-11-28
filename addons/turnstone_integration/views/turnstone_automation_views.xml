@@ -114,6 +114,20 @@
                                 This trigger carries its own context, so it needs no target model
                                 and no record filter.
                             </div>
+                            <field name="webhook_key"
+                                   invisible="trigger_type != 'webhook'"/>
+                            <div colspan="2" invisible="trigger_type != 'webhook'">
+                                <button name="action_rotate_webhook_key" type="object"
+                                        string="Rotate Webhook Key" class="btn-link"
+                                        icon="fa-refresh"
+                                        confirm="Rotate the webhook key? The current URL stops working immediately, and any sender still posting to it starts getting 404s until it is told the new one."/>
+                                <div class="text-muted small">
+                                    Send deliveries to
+                                    <code>/turnstone/webhook/&lt;Webhook Key&gt;</code>.
+                                    Rotating it is how a URL is withdrawn. The signature is what
+                                    authenticates a delivery; the key alone reaches nothing.
+                                </div>
+                            </div>
                         </group>
                     </group>
                     <group string="What it asks">
