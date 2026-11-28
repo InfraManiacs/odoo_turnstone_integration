@@ -1,3 +1,4 @@
+from . import test_automation_core
 from . import test_automation_launch
 from . import test_common
 from . import test_send_idempotency
