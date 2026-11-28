@@ -33,6 +33,32 @@
               sequence="20"
               groups="turnstone_integration.group_turnstone_user"/>
 
+    <!--
+        Both items are Administrator-only, and they sit at the root rather than
+        under Configuration for the reason Agents does: they are worked in, not
+        set up once. A rule is configuration — which agent to ask, what to ask,
+        whose authority the run borrows — so #5759 gives an ordinary User no access
+        to turnstone.automation at all. Runs are history a User may read over the
+        API, but reviewing and repairing one is an administrator's job, so the
+        screen is reached from the Administrator menu.
+
+        Sequences 25 and 26 fill the empty span between Sessions (20) and Live
+        Activity (30); no number here repeats within its parent.
+    -->
+    <menuitem id="menu_turnstone_automations"
+              name="Automations"
+              parent="menu_turnstone_root"
+              action="action_turnstone_automation"
+              sequence="25"
+              groups="turnstone_integration.group_turnstone_manager"/>
+
+    <menuitem id="menu_turnstone_automation_runs"
+              name="Runs"
+              parent="menu_turnstone_root"
+              action="action_turnstone_automation_run"
+              sequence="26"
+              groups="turnstone_integration.group_turnstone_manager"/>
+
     <menuitem id="menu_turnstone_live"
               name="Live Activity"
               parent="menu_turnstone_root"
