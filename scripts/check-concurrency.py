@@ -24,8 +24,10 @@ T9  Two concurrent `sync_from_server()` calls on one session must not raise a
 T10 A send must reach the remote exactly once when the transaction it was made
     in is rolled back and the handler re-run -- Odoo's `retrying()` does exactly
     that on a `SerializationFailure`, up to five times.
+T11 Two drain workers running the automation cron at the same time must not
+    double-process a queued run: every run is attempted by exactly one worker.
 
-Exit status is 0 only when both hold. Printed lines are the evidence; run it
+Exit status is 0 only when all of them hold. Printed lines are the evidence; run it
 with `--verbose` for the per-round detail.
 """
 
@@ -34,6 +36,7 @@ import functools
 import os
 import sys
 import threading
+import time
 from unittest.mock import patch
 
 import odoo
@@ -247,6 +250,169 @@ def t10_send_under_retry(registry, verbose):
     return failures, {"creates": len(creates), "workstreams": len(created)}
 
 
+def t11_concurrent_drains(registry, run_count, rounds, verbose):
+    """Two drain workers, one queue. Every run must be attempted exactly once.
+
+    This is OTI-5754's third acceptance criterion, and it can only be checked
+    with two genuine transactions on two connections: a `TransactionCase`
+    serialises every cursor behind one re-entrant lock, so a concurrency test
+    written there passes whatever the code does.
+
+    `_attempt_launch()` is replaced with a recording stub so this measures the
+    *claim*, not the network. That is the right seam: the launch itself is
+    #5749/#5786's subject and has its own tests, while "did two workers both pick
+    up the same row" is decided entirely by `_claim_for_drain()`. The stub still
+    moves the row (`running` -> `done`), so the state re-read wall is exercised
+    too, and it holds its claim long enough for the other worker to genuinely
+    collide rather than miss it by luck.
+    """
+    run_model = "turnstone.automation.run"
+    with registry.cursor() as cr:
+        env = _env(cr)
+        connection = env["turnstone.connection"].search([], limit=1)
+        if not connection:
+            connection = env["turnstone.connection"].create({
+                "name": "concurrency check",
+                "base_url": "http://stub.invalid",
+                "api_token": "stub-token",
+                "is_default": True,
+            })
+        # Re-entrant: a previous run of this script leaves its rule, agent and
+        # runs behind, and the unique names make a second create fail. The
+        # diagnostic cleans up after itself rather than needing a fresh database
+        # per attempt. Committed before the creates, so the deletes cannot be
+        # flushed into them.
+        env["turnstone.automation"].with_context(active_test=False).search([
+            ("name", "=", "concurrency check: drain rule"),
+        ]).unlink()
+        env["turnstone.agent"].search([
+            ("name", "=", "drain check agent"),
+        ]).unlink()
+        cr.commit()
+        agent = env["turnstone.agent"].create({
+            "name": "drain check agent",
+            "connection_id": connection.id,
+            "kind": "interactive",
+        })
+        partner_model = env["ir.model"]._get("res.partner")
+        rule = env["turnstone.automation"].create({
+            "name": "concurrency check: drain rule",
+            "company_id": env.company.id,
+            "agent_id": agent.id,
+            "trigger_type": "manual",
+            "target_model_id": partner_model.id,
+            "prompt_template": "Drain check.",
+            "run_as": "fixed_user",
+            "run_as_user_id": env.user.id,
+        })
+        run_ids = []
+        for index in range(run_count):
+            run = env[run_model].create({
+                "automation_id": rule.id,
+                "idempotency_key": "drain-check:%s" % index,
+            })
+            run_ids.append(run.id)
+        cr.commit()
+
+    failures = []
+    attempts = []
+    attempts_lock = threading.Lock()
+
+    def record_launch(self, run, record, triggering_user, prompt):
+        """Stand in for a real launch: record the claim, hold it, move the row.
+
+        Same signature as `turnstone.automation._attempt_launch(self, run, record,
+        triggering_user, prompt)` -- it is patched onto that model class, so
+        `self` arrives first.
+        """
+        with attempts_lock:
+            attempts.append(run.id)
+        time.sleep(0.05)  # hold the claim so the other worker really collides
+        run._mark_running()
+        run._mark_done()
+
+    for round_no in range(rounds):
+        del attempts[:]
+        barrier = threading.Barrier(2)
+        results = {}
+
+        def one(name):
+            """One drain worker: its own connection, its own cron-sized batch."""
+            try:
+                with registry.cursor() as cr:
+                    env = _env(cr)
+                    runs = env[run_model]
+                    # `_attempt_launch` lives on the RULE model -- it is one
+                    # attempt of a rule's launch, not a method of the run. The
+                    # class is looked up through the *registry*, not through
+                    # `type(env[...])`: Odoo builds a model class per registry,
+                    # so a class patched from this thread's environment would
+                    # not be the one the other thread's environment uses.
+                    rule_model = registry["turnstone.automation"]
+                    original = rule_model._attempt_launch
+                    rule_model._attempt_launch = record_launch
+                    try:
+                        barrier.wait(timeout=30)
+                        # Both workers see the WHOLE queue, so nothing is left
+                        # over simply because one worker's batch ended: the claim
+                        # alone decides who gets each run.
+                        runs._drain_queue(limit=len(run_ids))
+                        env.flush_all()
+                    finally:
+                        rule_model._attempt_launch = original
+                    cr.commit()
+                results[name] = "ok"
+            except Exception as exc:  # noqa: BLE001 - the point is to classify it
+                results[name] = "%s: %s" % (type(exc).__name__, str(exc).splitlines()[0])
+
+        threads = [
+            threading.Thread(target=one, args=(name,)) for name in ("A", "B")
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=120)
+
+        bad = {name: result for name, result in results.items() if result != "ok"}
+        if bad:
+            failures.append("round %d: a drain worker failed: %s" % (round_no, bad))
+        duplicated = sorted(
+            {run_id for run_id in attempts if attempts.count(run_id) > 1}
+        )
+        if duplicated:
+            failures.append(
+                "round %d: two workers launched the same run(s) %r"
+                % (round_no, duplicated)
+            )
+        missing = sorted(set(run_ids) - set(attempts))
+        if missing:
+            failures.append(
+                "round %d: no worker launched run(s) %r" % (round_no, missing)
+            )
+        if verbose:
+            print("  T11 round %d: %d attempt(s) for %d run(s)"
+                  % (round_no, len(attempts), len(run_ids)))
+
+        # Refill the queue for the next round. A direct UPDATE because `write()`
+        # refuses to move a finished run back to `queued` -- the state graph is
+        # the guard under test elsewhere, and this is a fixture standing in for
+        # "the queue filled up again", not a behaviour being tested.
+        if round_no + 1 < rounds:
+            with registry.cursor() as cr:
+                cr.execute(
+                    """UPDATE turnstone_automation_run
+                          SET state = 'queued', attempt_count = 0,
+                              started_at = NULL, finished_at = NULL,
+                              session_id = NULL
+                        WHERE id = ANY(%s)""",
+                    [run_ids],
+                )
+                cr.commit()
+
+    return failures, {"runs": len(run_ids), "attempts": len(attempts)}
+
+
+
 def _exit(status):
     """Leave without Odoo's shell trying to keep going.
 
@@ -294,12 +460,19 @@ def main():
         "PASS: one send, one workstream, retry adopted it" if not found else "FAIL",
         stats["creates"], stats["workstreams"]))
 
+    print("T11 two drain workers must not double-process a queued run")
+    found, stats = t11_concurrent_drains(registry, 12, args.rounds, args.verbose)
+    failures.extend(found)
+    print("T11 %s (%d run(s), last round attempted %d)"
+          % ("PASS: every run attempted exactly once" if not found else "FAIL",
+             stats["runs"], stats["attempts"]))
+
     if failures:
         print("\nFAILED:")
         for failure in failures:
             print("  - %s" % failure)
         _exit(1)
-    print("\nOK: both concurrency checks hold.")
+    print("\nOK: all concurrency checks hold.")
     _exit(0)
 
 

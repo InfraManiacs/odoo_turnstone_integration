@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    The one scheduled job this module ships: drain the automation run queue.
+
+    WHY IT EXISTS
+
+    Every trigger adapter (#5752-#5756) does the same cheap, transactional thing:
+    it writes a `turnstone.automation.run` row in state `queued`. None of them
+    launches, because they all run inside somebody else's transaction (a form
+    save, a customer's message post, an inbound HTTP request) and the launch
+    service is an HTTP call of up to 120 seconds. This cron is what turns those
+    queued intents into sessions, on its own thread, with nothing of the user's
+    waiting behind it.
+
+    WHY ITS INTERVAL IS A CONFIGURATION VALUE, NOT THIS FILE'S NUMBER
+
+    `interval_number` below is the default. The setting that decides it is
+    `turnstone_integration.drain_interval_minutes` in `ir.config_parameter`, and
+    `_sync_drain_interval()` on the run model mirrors it onto this row at install
+    time and whenever the settings form is saved. A number written only here
+    would be a setting that quietly does nothing — an administrator would change
+    the parameter and see no change until they found this file.
+
+    That is also why the record is `noupdate="1"`: an upgrade must not overwrite
+    the interval a deployment has configured. The mirroring method is what
+    changes it afterwards.
+
+    WHY `base.user_root`
+
+    The cron runs as the superuser because it must be able to read every queued
+    run and reach the connection's token to launch. It does NOT launch anything
+    as the superuser: the rule's `run_as` setting decides whose identity each
+    session belongs to, and `_resolve_run_as_user()` refuses rather than falling
+    back to root. See `_launch_claimed_run()` on the run model.
+-->
+<odoo noupdate="1">
+    <record id="ir_cron_turnstone_drain_runs" model="ir.cron">
+        <field name="name">Turnstone: drain automation runs</field>
+        <field name="model_id" ref="model_turnstone_automation_run"/>
+        <field name="state">code</field>
+        <field name="code">model._drain_queue()</field>
+        <field name="user_id" ref="base.user_root"/>
+        <field name="interval_number">1</field>
+        <field name="interval_type">minutes</field>
+        <field name="nextcall" eval="(DateTime.now() + timedelta(minutes=1)).strftime('%Y-%m-%d %H:%M:%S')"/>
+        <field name="priority">5</field>
+        <field name="active" eval="True"/>
+    </record>
+
+    <!--
+        The schedule scanner. A separate cron rather than a second call in the
+        drain, because the two answer different questions and a deployment may
+        reasonably want different cadences for them: the drain is latency on
+        events that have already happened (as often as possible), while the
+        scanner walks a due-date index on a business model (as rarely as the
+        shortest rule window needs). Keeping them separate also means a slow
+        scan cannot delay draining an event somebody is waiting on.
+
+        It is `active="False"` on install. A fresh install has no `schedule`
+        rules, so there is nothing to scan; an administrator turns it on when
+        they write the first one, and the rule's own form says so. Shipping a
+        cron that walks a business model on every instance that installed the
+        module, whether or not it uses schedules, is a cost nobody asked for.
+    -->
+    <record id="ir_cron_turnstone_run_schedules" model="ir.cron">
+        <field name="name">Turnstone: fire due automation schedules</field>
+        <field name="model_id" ref="model_turnstone_trigger_schedule"/>
+        <field name="state">code</field>
+        <field name="code">model._run_due_schedules()</field>
+        <field name="user_id" ref="base.user_root"/>
+        <field name="interval_number">5</field>
+        <field name="interval_type">minutes</field>
+        <field name="nextcall" eval="(DateTime.now() + timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')"/>
+        <field name="priority">10</field>
+        <field name="active" eval="False"/>
+    </record>
+</odoo>

@@ -1,6 +1,7 @@
 from . import test_automation_core
 from . import test_automation_launch
 from . import test_automation_ui
+from . import test_automation_worker
 from . import test_common
 from . import test_send_idempotency
 from . import test_session_create
