@@ -20,12 +20,21 @@ import uuid
 from odoo import _
 from odoo.exceptions import UserError
 
+from .redaction import redact
+
 _logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 30
 # Creating a session with an initial_message can block while the first turn is
 # dispatched, and a tool-heavy turn is slower still.
 LONG_TIMEOUT = 120
+
+# How much of a failing response body is kept. A 500 body is a sentence or a
+# JSON object at best and a proxy's HTML error page at worst; 500 characters is
+# enough for the reason and short enough that a page cannot become a log line.
+# Applied AFTER redaction, never before: a body cut at the wrong character
+# leaves a prefix of the token, which no pattern can match afterwards.
+BODY_EXCERPT_CHARS = 500
 
 # How many conversation rows a session detail read asks for.
 #
@@ -90,6 +99,16 @@ class TurnstoneClient:
         self.token = token
         self.timeout = timeout
 
+    def _redact(self, text):
+        """`text` with anything credential-shaped taken out, including our token.
+
+        The token is passed explicitly as well as matched by shape: a server
+        that echoes it in some arrangement no pattern anticipates (a wrapped
+        line, a quoted fragment, a hash) is still caught by the literal, and the
+        literal is the only thing this client knows for certain is secret.
+        """
+        return redact(text, (self.token,))
+
     # -- transport ---------------------------------------------------------
 
     def _request(self, method, path, payload=None, params=None, timeout=None):
@@ -112,8 +131,24 @@ class TurnstoneClient:
                 raw = resp.read().decode()
                 return json.loads(raw) if raw.strip() else {}
         except urllib.error.HTTPError as exc:
-            body = exc.read().decode()[:500]
-            _logger.warning("Turnstone %s %s -> HTTP %s: %s", method, path, exc.code, body)
+            # Read once, clean once. Both things built from this body leave the
+            # process as text someone else logs: the warning below, and the
+            # `TurnstoneError` message -- which `TurnstoneError` being a
+            # `UserError` means Odoo's own WSGI handler writes to the log too
+            # (`odoo/http.py`, `elif isinstance(exc, UserError):
+            # _logger.warning(exc)`). A 500 that echoes the request carries
+            # `Authorization: Bearer <token>` in this body, so redacting only the
+            # line below would leave the token in the log by the other door.
+            #
+            # Redact BEFORE the excerpt is cut, not after: a body cut at exactly
+            # the wrong character leaves a prefix of the token, which no pattern
+            # and no literal can then match. The read is whole either way, so
+            # ordering the two costs nothing.
+            body = self._redact(exc.read().decode())[:BODY_EXCERPT_CHARS]
+            _logger.warning(
+                "Turnstone %s %s -> HTTP %s: %s",
+                method, self._redact(path), exc.code, body,
+            )
             if exc.code in (401, 403):
                 raise TurnstoneError(
                     _("Turnstone rejected the API token (HTTP %s). Check the connection's token "
@@ -309,7 +344,10 @@ class TurnstoneClient:
             with urllib.request.urlopen(req, timeout=LONG_TIMEOUT) as resp:
                 return json.loads(resp.read().decode() or "{}")
         except urllib.error.HTTPError as exc:
-            payload = exc.read().decode()[:400]
+            # Same shape as `_request`: this payload becomes a `TurnstoneError`
+            # message, and Odoo's WSGI handler logs a `UserError` (and so this
+            # subclass) verbatim. Clean it here, once, before either happens.
+            payload = self._redact(exc.read().decode())[:BODY_EXCERPT_CHARS]
             try:
                 message = json.loads(payload).get("error") or payload
             except json.JSONDecodeError:

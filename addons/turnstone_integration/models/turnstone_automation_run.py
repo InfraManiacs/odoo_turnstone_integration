@@ -49,11 +49,12 @@ honestly claim the agent finished — and a run whose session later fails stays
 event not reach an agent", which is the question a person actually asks.
 """
 
-import re
 import uuid
 
 from odoo import _, api, fields, models
 from odoo.exceptions import UserError
+
+from .redaction import redact
 
 # The state graph. `done` and `skipped` are terminal by having no successors: a
 # later event is a new run with its own key, never a reopened row — a history
@@ -87,15 +88,10 @@ IMMUTABLE_FIELDS = (
 # a visible marker so nobody mistakes a truncated message for the whole one.
 MAX_ERROR_CHARS = 2000
 
-# What a credential looks like when a client library prints a request. The
-# token must never reach this table: a run history is readable by more people
-# than a connection is (the token itself is manager-only), and an error message
-# is exactly where a bearer header leaks by accident.
-_REDACTIONS = (
-    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+"),
-    re.compile(r"(?i)\bAuthorization:\s*\S+"),
-    re.compile(r"(?i)\bapi[_-]?token\s*[=:]\s*\S+"),
-)
+# What a credential looks like when a client library prints a request lives in
+# `models/redaction.py`, shared with `TurnstoneClient` — the client's own warning
+# line is written before any run exists, and two copies of these patterns would
+# let one drift and re-open the leak the other closed.
 
 
 class TurnstoneAutomationRun(models.Model):
@@ -541,12 +537,7 @@ class TurnstoneAutomationRun(models.Model):
         history is readable by more people than a connection is, so an error
         message is exactly the wrong place for a bearer header.
         """
-        text = str(text or "")
-        for secret in secrets or ():
-            if secret:
-                text = text.replace(secret, "[redacted]")
-        for pattern in _REDACTIONS:
-            text = pattern.sub("[redacted]", text)
+        text = redact(text, secrets)
         if len(text) > MAX_ERROR_CHARS:
             text = text[:MAX_ERROR_CHARS] + _(" … [truncated]")
         return text

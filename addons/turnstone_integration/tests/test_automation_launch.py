@@ -42,8 +42,12 @@ from unittest.mock import patch
 from odoo.exceptions import UserError
 from odoo.tests import TransactionCase, tagged
 
+from odoo.addons.turnstone_integration.models.redaction import REDACTED
 from odoo.addons.turnstone_integration.models.turnstone_automation_run import (
     MAX_ERROR_CHARS,
+)
+from odoo.addons.turnstone_integration.models.turnstone_client import (
+    BODY_EXCERPT_CHARS,
 )
 
 # The mock server's address inside the compose test network
@@ -107,7 +111,7 @@ def _creates():
 
 
 class FailingTransport:
-    """`urllib.request.urlopen` replaced by one that answers 500 with a body.
+    """`urllib.request.urlopen` replaced by one that answers with an error.
 
     Deliberately NOT a stub of `TurnstoneClient`: the real client builds the
     error message, the real `_request` classifies the status, and the launch
@@ -117,14 +121,20 @@ class FailingTransport:
     The body can carry the token because that is exactly how a bearer header
     reaches an error message in the wild: a proxy echoing the request, or a
     framework printing its headers on an exception page.
+
+    The status is a parameter because the leak is not a 500-only shape: a 401
+    from a server that echoes the request, or a 4xx from a console that prints
+    the offending URL, puts the credential in the same body and reaches the same
+    log line.
     """
 
-    def __init__(self, body):
+    def __init__(self, body, code=500):
         self.body = body
+        self.code = code
 
     def __call__(self, request, timeout=None):
         raise urllib.error.HTTPError(
-            request.full_url, 500, "Internal Server Error", {},
+            request.full_url, self.code, "Internal Server Error", {},
             io.BytesIO(self.body.encode()),
         )
 
@@ -221,9 +231,9 @@ class AutomationLaunchCase(TransactionCase):
             "group_ids": [(6, 0, [g.id for g in groups])],
         })
 
-    def _patched_transport(self, body):
+    def _patched_transport(self, body, code=500):
         """Replace the socket, not the client: the real error path runs."""
-        return patch("urllib.request.urlopen", FailingTransport(body))
+        return patch("urllib.request.urlopen", FailingTransport(body, code))
 
 
 @tagged("post_install", "-at_install")
@@ -775,3 +785,230 @@ class TestLaunchWhileSudoed(AutomationLaunchCase):
         self.assertEqual(run.state, "done", run.error)
         self.assertEqual(run.session_id.user_id, self.env.user,
                          "sudo() must not make the session root's")
+
+
+@tagged("post_install", "-at_install")
+class TestClientErrorLogging(AutomationLaunchCase):
+    """The client's own log line: a failing call must not print the token.
+
+    `TurnstoneClient._request` runs before any caller exists, so it cannot rely
+    on its callers to clean anything: whatever it writes is already in the Odoo
+    log by the time the launch service, or a chat controller, sees the exception.
+    A 500 that echoes the request is the real shape of the leak — a proxy
+    repeating the request, or a framework printing headers on an exception page
+    — and that body carries `Authorization: Bearer <token>`.
+
+    These cases capture the client logger directly with `assertLogs`, rather
+    than inferring from a run's `error` column: the column is cleaned by a
+    different piece of code (`_clean_text`), so a green assertion there would
+    say nothing about the log.
+    """
+
+    #: The logger `_request` warns on. Named, not `""`/root: capturing the root
+    #: logger would also pick up Odoo's own request logging, and a passing
+    #: assertion would no longer be about this line.
+    LOGGER = "odoo.addons.turnstone_integration.models.turnstone_client"
+
+    def _client_log(self, body, code=500):
+        """The client's log output for one failing request, as one string."""
+        with self.assertLogs(self.LOGGER, level="DEBUG") as captured:
+            with self._patched_transport(body, code):
+                with self.assertRaises(UserError):
+                    self.connection._client().whoami()
+        return "\n".join(captured.output)
+
+    def _assert_token_free(self, logged, token=MOCK_TOKEN):
+        self.assertNotIn(token, logged,
+                         "the API token reached the Odoo log through a client "
+                         "error; a log aggregator is read by more people than a "
+                         "connection is")
+        self.assertNotIn("Bearer " + token, logged)
+        self.assertNotIn(token[:12], logged,
+                         "no fragment of the token either — a truncated body must "
+                         "not leave a prefix behind")
+
+    # -- criterion 1: the token cannot reach the log ------------------------
+
+    def test_an_echoed_bearer_header_is_not_logged(self):
+        """The exact shape the ticket names: a 500 whose body echoes the request."""
+        body = 'upstream said: Authorization: Bearer %s' % MOCK_TOKEN
+        logged = self._client_log(body)
+
+        self._assert_token_free(logged)
+        self.assertIn(REDACTED, logged,
+                      "the secret is replaced, not the whole diagnostic dropped")
+        self.assertIn("HTTP 500", logged, "the status still has to be logged")
+
+    def test_the_token_is_not_logged_even_in_a_shape_no_pattern_knows(self):
+        """Explicit secrets are the backstop: the client knows its own token.
+
+        A server that prints the token as a bare fragment — no `Bearer`, no
+        header name, no parameter — defeats every pattern. It does not defeat
+        the literal, which is why the client passes it.
+        """
+        body = "the value %s was rejected by node-3" % MOCK_TOKEN
+        logged = self._client_log(body)
+
+        self._assert_token_free(logged)
+        self.assertIn("node-3", logged, "the rest of the reason survives")
+
+    def test_a_json_body_quoting_the_request_headers_is_not_logged(self):
+        """A framework's exception page is JSON, not a sentence."""
+        body = json.dumps({
+            "error": "boom",
+            "request": {"headers": {"Authorization": "Bearer " + MOCK_TOKEN}},
+        })
+        logged = self._client_log(body)
+
+        self._assert_token_free(logged)
+        self.assertIn("boom", logged)
+
+    def test_a_4xx_body_carrying_the_token_is_not_logged(self):
+        """The leak is not 500-only: a 4xx echo reaches the same line."""
+        body = '{"detail": "unauthorized for Authorization: Bearer %s"}' % MOCK_TOKEN
+        logged = self._client_log(body, code=422)
+
+        self._assert_token_free(logged)
+        self.assertIn("HTTP 422", logged)
+
+    def test_a_token_in_a_query_parameter_is_not_logged(self):
+        """A console that prints the URL it refused, credential and all."""
+        body = "GET /v1/api/cluster/ws?token=%s&page=2 -> denied" % MOCK_TOKEN
+        logged = self._client_log(body)
+
+        self._assert_token_free(logged)
+        self.assertIn("token=", logged,
+                      "the parameter's name stays: a redacted line is still "
+                      "diagnosable, a blanked one is not")
+
+    def test_the_raised_error_is_clean_too(self):
+        """The other door into the log: Odoo logs a `UserError`'s message.
+
+        `TurnstoneError` subclasses `UserError`, and `odoo/http.py` answers one
+        with `_logger.warning(exc)`. The exception's text is built from the same
+        response body, so it has to be clean at the source — redacting only our
+        own warning line would leave the token in the log whenever the request
+        came from a controller rather than the launch service.
+        """
+        body = 'Authorization: Bearer %s' % MOCK_TOKEN
+        with self._patched_transport(body):
+            with self.assertRaises(UserError) as raised:
+                self.connection._client().whoami()
+
+        self._assert_token_free(str(raised.exception))
+        self.assertIn("HTTP 500", str(raised.exception),
+                      "the reason still has to reach the caller")
+
+    # -- criterion 2: the reason is still logged, redacted and bounded -------
+
+    def test_the_log_line_still_names_the_method_the_path_and_the_status(self):
+        """Criterion 2: redaction removes the secret, not the diagnostic."""
+        logged = self._client_log(
+            'Authorization: Bearer %s' % MOCK_TOKEN
+        )
+
+        self.assertIn("GET", logged)
+        self.assertIn("/auth/whoami", logged,
+                      "the path is how a person knows which call failed")
+        self.assertIn("HTTP 500", logged)
+
+    def test_a_body_with_no_secret_is_logged_whole(self):
+        """And nothing is over-redacted into uselessness."""
+        logged = self._client_log('{"error": "queue is full"}')
+
+        self.assertIn("queue is full", logged)
+        self.assertNotIn(REDACTED, logged,
+                         "nothing secret was there, so nothing is replaced")
+
+    def test_the_logged_body_is_still_bounded(self):
+        """A proxy's HTML error page must not become a log line.
+
+        The bound is asserted on the log output itself, not on the exception:
+        this is the line the ticket is about.
+        """
+        logged = self._client_log("x" * 5000)
+
+        self.assertLessEqual(
+            len(logged), BODY_EXCERPT_CHARS + 200,
+            "the logged excerpt must stay near the 500-character bound; the "
+            "rest of the line is the method, path and status",
+        )
+
+    def test_a_long_body_with_a_secret_at_the_end_is_still_redacted(self):
+        """Bounding before redacting must not let the tail through.
+
+        The excerpt is cut first, so a secret past the cut is not logged at all
+        — and one just inside it is still redacted. Both outcomes are safe; this
+        pins the second, where the two bounds interact.
+        """
+        body = "x" * 400 + " Authorization: Bearer %s" % MOCK_TOKEN
+        logged = self._client_log(body)
+
+        self._assert_token_free(logged)
+
+    # -- no other client behaviour moved ------------------------------------
+
+    def test_a_classified_status_still_raises_its_own_error(self):
+        """Redaction happens at the read; classification is untouched.
+
+        401 and 404 have their own exception types and their own messages, and
+        a fix that rewrote the whole handler could quietly collapse them.
+        """
+        from odoo.addons.turnstone_integration.models.turnstone_client import (
+            TurnstoneError,
+            TurnstoneNotFound,
+        )
+
+        with self._patched_transport("no", code=401):
+            with self.assertRaises(TurnstoneError) as unauthorized:
+                self.connection._client().whoami()
+        self.assertIn("rejected the API token", str(unauthorized.exception))
+
+        with self._patched_transport("no", code=404):
+            with self.assertRaises(TurnstoneNotFound):
+                self.connection._client().whoami()
+
+
+@tagged("post_install", "-at_install")
+class TestRedactionHelper(AutomationLaunchCase):
+    """The shared helper and `_clean_text`, tested where they actually run.
+
+    Two layers take credentials out of text, and this ticket touched both: the
+    client cleans a response body before it logs or raises, and the run model
+    cleans every message it *stores* (`_clean_text`). A test that only exercises
+    the client would leave the second layer unpinned — it is still the one that
+    covers an exception the client never built (a `_launch_secrets()` literal in
+    a message from anywhere else), so it gets its own assertions here.
+    """
+
+    def test_clean_text_still_redacts_after_the_shared_extraction(self):
+        """The run model's own layer, asserted directly.
+
+        Before this ticket the patterns lived in `turnstone_automation_run`.
+        They now live in `models/redaction.py` and `_clean_text` calls that; this
+        case is what proves the extraction did not quietly drop the behaviour
+        while the client's own cleaning made the end-to-end case pass anyway.
+        """
+        run = self.env["turnstone.automation.run"]
+        cleaned = run._clean_text(
+            "Authorization: Bearer %s" % MOCK_TOKEN, [MOCK_TOKEN],
+        )
+
+        self.assertNotIn(MOCK_TOKEN, cleaned)
+        self.assertIn(REDACTED, cleaned)
+
+    def test_clean_text_takes_an_explicit_secret_in_any_shape(self):
+        """The literal layer: a secret no pattern could recognise."""
+        run = self.env["turnstone.automation.run"]
+        cleaned = run._clean_text("node-3 said %s" % MOCK_TOKEN, [MOCK_TOKEN])
+
+        self.assertNotIn(MOCK_TOKEN, cleaned)
+        self.assertIn("node-3 said", cleaned)
+
+    def test_clean_text_is_still_bounded(self):
+        """And the cap the run history depends on survived the extraction."""
+        run = self.env["turnstone.automation.run"]
+        cleaned = run._clean_text("z" * (MAX_ERROR_CHARS + 500))
+
+        self.assertLessEqual(len(cleaned), MAX_ERROR_CHARS + 50)
+        self.assertIn("truncated", cleaned)
