@@ -53,6 +53,19 @@ class TurnstoneError(UserError):
     """A Turnstone API call failed in a way the user should see."""
 
 
+class TurnstoneConflict(TurnstoneError):
+    """Turnstone answered HTTP 409: the resource is already there.
+
+    A subclass so every existing ``except TurnstoneError`` still catches it.
+    It exists because 409 means something different from every other failure
+    for a create: the caller is not being refused, it is being told that the
+    thing it asked for already exists -- which, when the caller supplied the
+    id itself, is the "this already happened" answer a retried request needs
+    (``create_session``'s ``ws_id``). The message text is useless for that
+    decision -- it is translated.
+    """
+
+
 class TurnstoneNotFound(TurnstoneError):
     """Turnstone answered HTTP 404: the resource is not there any more.
 
@@ -110,6 +123,11 @@ class TurnstoneClient:
                 raise TurnstoneNotFound(
                     _("Turnstone has no such resource (HTTP 404 on %s). The session may have been "
                       "deleted on the server.") % path
+                ) from exc
+            if exc.code == 409:
+                raise TurnstoneConflict(
+                    _("Turnstone already has this resource (HTTP 409 on %s): %s")
+                    % (path, body)
                 ) from exc
             raise TurnstoneError(
                 _("Turnstone returned HTTP %(code)s for %(path)s:\n%(body)s")
@@ -181,7 +199,7 @@ class TurnstoneClient:
 
     def create_session(self, name=None, skill=None, persona=None, model=None,
                        initial_message=None, kind="interactive", judge_model=None,
-                       auto_approve=None, auto_approve_tools=None):
+                       auto_approve=None, auto_approve_tools=None, ws_id=None):
         """Start a workstream, on whichever surface owns that kind.
 
         The console/route split applies to CREATION too, and Turnstone is
@@ -214,7 +232,24 @@ class TurnstoneClient:
             # and nothing else — model, judge_model and the auto-approve fields
             # are simply absent from its schema, so passing them would be a lie
             # rather than a setting. Callers are told this at the UI layer.
+            #
+            # `ws_id` is absent from that schema too: the console has no way to
+            # be told which id to use, so a coordinator create cannot be made
+            # idempotent this way. Dropping the argument silently is right --
+            # the alternative is a create that looks keyed and is not -- and
+            # the caller is told (see `TurnstoneSession._ensure_started`).
             return self._request("POST", "/workstreams/new", payload, timeout=LONG_TIMEOUT)
+
+        if ws_id:
+            # A caller-supplied id is honoured by the routing proxy verbatim,
+            # and a SECOND create with the same one answers HTTP 409
+            # "Workstream already exists" instead of making a second
+            # workstream. That is the native idempotency mechanism this module
+            # uses to survive a transaction retry re-running a create; it is
+            # not documented as an idempotency key, but it behaves as one for
+            # JSON callers because the destination id is reserved before the
+            # body lands. Verified against Turnstone 1.8.3 (OTI-5763 Q3).
+            payload["ws_id"] = ws_id
 
         payload["kind"] = "interactive"
         payload["client_type"] = "web"
