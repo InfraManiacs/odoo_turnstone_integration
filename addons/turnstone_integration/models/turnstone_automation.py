@@ -1000,7 +1000,8 @@ class TurnstoneAutomation(models.Model):
 
         * `failed` with `attempt_count == 0` — refused before anything was
           tried: no permission, no company, a record of another company, a
-          prompt that would not render.
+          prompt that would not render, a prompt that **rendered to nothing**
+          (a template of only placeholders against a blank field).
         * `failed` with an odd count — an attempt was made and did not land.
         * `skipped` — the event arrived and the rule's own window suppressed it.
         * `queued` — the intent is committed (this run, and the `draft` session its
@@ -1040,7 +1041,10 @@ class TurnstoneAutomation(models.Model):
             is coarser than one record.
         ``prompt``
             Overrides the rendered template. The rendered prompt is untrusted
-            content either way: it travels only as the message body.
+            content either way: it travels only as the message body. An
+            override is subject to the same emptiness check as a render — an
+            explicit `""` would otherwise start a workstream with no
+            instruction and report `done` (OTI-5789).
 
         A repeat call with the same key is answered with the run the first call
         produced and sends nothing — except when that run is `failed`. A failed
@@ -1195,6 +1199,24 @@ class TurnstoneAutomation(models.Model):
             _logger.warning(
                 "Automation %s could not render its prompt: %s",
                 self.name, run._clean_text(exc),
+            )
+            return self._fail_run(run, exc)
+
+        # 5b. The render can succeed and still carry no instruction (OTI-5789).
+        #     `_check_prompt_template()` validates the TEMPLATE, which is a
+        #     different promise: `{{ email }}` is a good template and a record
+        #     with no email renders it to `""`. Sending that starts a
+        #     workstream with no prompt in it (`create_session()` gates
+        #     `initial_message` on truthiness) and marks the run `done`, whose
+        #     meaning is "a session exists AND the prompt was delivered to it".
+        #     Refused here, so there is no session row, nothing is armed and no
+        #     HTTP is made; `attempt_count` stays 0 because nothing was tried.
+        try:
+            self._check_rendered_prompt(body)
+        except UserError as exc:
+            _logger.warning(
+                "Automation %s refused run %s: the prompt rendered to nothing.",
+                self.name, run.id,
             )
             return self._fail_run(run, exc)
         run._record_prompt(body)
@@ -1416,6 +1438,14 @@ class TurnstoneAutomation(models.Model):
                 # attempt count unchanged says "not tried, and why". Called on
                 # the rule (not `self`, which is an empty recordset here).
                 return rule._fail_run(run, exc)
+        # The same refusal as in `_attempt_launch()`, and reachable here for a
+        # reason that only exists because delivery is a second phase: the
+        # re-render happens NOW, so a record that lost the field's value between
+        # the intent commit and this call renders to nothing (OTI-5789). It sits
+        # AFTER the claim, so only the one launcher that holds this run's
+        # delivery slot can refuse it — a refusal written by a bystander would
+        # contradict a delivery another worker is making right now — and BEFORE
+        # `_mark_running()`, so nothing is counted: nothing was tried.
         if not self._claim_delivery(run_id):
             # Another launcher is delivering the same run right now (the run
             # worker, or a duplicate arm from a second request). It stays queued
@@ -1425,6 +1455,10 @@ class TurnstoneAutomation(models.Model):
                 "worker; leaving it alone.", run_id,
             )
             return run
+        try:
+            rule._check_rendered_prompt(body)
+        except UserError as exc:
+            return rule._fail_run(run, exc)
 
         run._mark_running()
         try:
@@ -1541,6 +1575,52 @@ class TurnstoneAutomation(models.Model):
             })
         agent._check_user_allowed(owner)
         return True
+
+    def _check_rendered_prompt(self, body):
+        """Raise when `body` carries no instruction for the agent.
+
+        `_check_prompt_template()` refuses a blank *template*, and that is not
+        the same promise as a *render*: `{{ email }}` is a perfectly good
+        template, and a record whose email is empty renders it to `""` —
+        `_render_value()` answers `""` for a falsy value. Sending that creates a
+        workstream with **no prompt at all**, because
+        `TurnstoneClient.create_session()` gates `initial_message` on
+        truthiness, so the field is absent from the request; the session then
+        starts `idle` (`"thinking" if first_message else "idle"`) and the run is
+        marked `done`, whose documented meaning is "a session exists AND the
+        prompt was delivered to it". The event reached an agent with no
+        instruction, silently, and the run history says everything worked
+        (OTI-5789).
+
+        So an empty or whitespace-only body is refused as `failed` with
+        `attempt_count == 0`: the same shape as a template that will not render,
+        because nothing was tried either. Only *nothing* refuses. A render that
+        merely lost a placeholder still carries the text around it, and
+        `_render_value()`'s `MAX_VALUE_CHARS` cap with its `… [truncated]` marker
+        is content, not emptiness.
+
+        The message names the rule and the situation, never the record's values:
+        it is stored on a run row, and the reason the render was empty is a
+        blank field, which is the business data this must not copy.
+
+        A non-string body is judged by truthiness, the same gate
+        `create_session()` applies to it, so the two cannot disagree about what
+        "no prompt" means.
+        """
+        self.ensure_one()
+        if isinstance(body, str):
+            empty = not body.strip()
+        else:
+            empty = not body
+        if not empty:
+            return True
+        raise UserError(_(
+            "%(rule)s's prompt rendered to nothing for this event, so the agent "
+            "would have been started with no instruction. A prompt made only of "
+            "placeholders — {{ field }} with a blank field — renders empty when "
+            "the record has nothing in it; write some text of your own beside "
+            "the placeholders, or fill the field in.",
+        ) % {"rule": self.name})
 
     def _check_record_company(self, record):
         """Raise unless `record`'s company is this rule's, when it has one.
