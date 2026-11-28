@@ -1183,22 +1183,30 @@ class TurnstoneAutomation(models.Model):
         def deliver_armed_launches():
             # `with registry.cursor()` commits on success and rolls back on a
             # failure that reached this far, which is the whole of the error
-            # handling the hook itself needs.
+            # handling the hook itself needs. `jobs` is passed explicitly: this
+            # cursor's own `postcommit` queue belongs to the *caller's*
+            # transaction, and the fresh cursor has an empty one of its own.
             with registry.cursor() as cr:
                 env = api.Environment(cr, SUPERUSER_ID, context)
-                env["turnstone.automation"]._deliver_pending()
+                env["turnstone.automation"]._deliver_armed(jobs)
 
         return True
 
     @api.model
     def _deliver_pending(self):
-        """Deliver the launches the current transaction armed, and forget them.
+        """Deliver, now, the launches *this* transaction armed for post-commit.
 
-        The body of the post-commit hook, as a method so it can be called
-        directly: a test cannot wait for a real commit (`TestCursor` clears
-        `postcommit` instead of running it), and a future queue worker that takes
-        over from a dead process wants the same entry point. Popping the list is
-        what makes a second call a no-op rather than a second delivery.
+        The post-commit hook's body, callable directly for the two callers that
+        cannot wait for a real commit:
+
+        * a test — `TestCursor.commit()` clears `postcommit` instead of running
+          it, so a case that wants to assert on the delivery has to drive it;
+        * a caller in a transaction it does not own (a `--test-enable` run, a
+          shell) that wants the delivery to happen before it commits.
+
+        Popping the queue is what makes a second call a no-op rather than a
+        second delivery. The hook itself does not come through here — it holds
+        the list this transaction armed, which a fresh cursor cannot see.
         """
         jobs = self.env.cr.postcommit.data.pop(DELIVERY_JOBS_KEY, None)
         if not jobs:
