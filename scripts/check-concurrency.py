@@ -168,30 +168,44 @@ def t9_concurrent_syncs(registry, session_id, rounds, verbose):
         barrier = threading.Barrier(2)
         results = {}
 
+        # The patch wraps the round, not each worker. Entered per worker it is a
+        # leak: two threads entering `patch.object` on ONE class means the
+        # second saves the first's stub as "the original", so unwinding puts the
+        # stub back and `_client` stays patched for the rest of the process.
+        # The next check then gets a canned client instead of its own and
+        # silently measures nothing -- T12 read 0 creates and a `done` run at
+        # once because of exactly this.
+        local = threading.local()
+
         def one(name):
             """One request: its own cursor, its own client, one commit."""
+            local.client = clients.setdefault(name, CannedClient(messages))
             try:
                 with registry.cursor() as cr:
                     env = _env(cr)
                     session = env["turnstone.session"].browse(session_id)
-                    client = clients.setdefault(name, CannedClient(messages))
-                    with patch.object(
-                        type(session.connection_id), "_client",
-                        lambda self, timeout=None: client,
-                    ):
-                        barrier.wait(timeout=30)
-                        session.sync_from_server()
-                        env.flush_all()
+                    barrier.wait(timeout=30)
+                    session.sync_from_server()
+                    env.flush_all()
                     cr.commit()
                 results[name] = "ok"
             except Exception as exc:  # noqa: BLE001 - the point is to classify it
                 results[name] = "%s: %s" % (type(exc).__name__, str(exc).splitlines()[0])
+            finally:
+                del local.client
 
-        threads = [threading.Thread(target=one, args=(n,)) for n in ("A", "B")]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(timeout=120)
+        # The stub is per thread (`threading.local`), because both workers patch
+        # the same class method: which canned answer a call gets has to be
+        # decided by who is calling, not by an argument it happens to carry.
+        with patch.object(
+            registry["turnstone.connection"], "_client",
+            lambda self, timeout=None: local.client,
+        ):
+            threads = [threading.Thread(target=one, args=(n,)) for n in ("A", "B")]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=120)
         bad = {n: r for n, r in results.items() if r != "ok"}
         if bad:
             failures.append("round %d: %s" % (round_no, bad))
@@ -366,83 +380,92 @@ def t11_concurrent_drains(registry, run_count, rounds, verbose):
         run._mark_running()
         run._mark_done()
 
-    for round_no in range(rounds):
-        del attempts[:]
-        barrier = threading.Barrier(2)
-        results = {}
+    # `_attempt_launch` lives on the RULE model -- it is one attempt of a rule's
+    # launch, not a method of the run. The class is looked up through the
+    # *registry*, not through `type(env[...])`: Odoo builds a model class per
+    # registry, so a class patched from one thread's environment would not be
+    # the one the other thread's environment uses.
+    rule_model = registry["turnstone.automation"]
+    # Saved and restored AROUND the whole round loop, not inside each worker.
+    # Restoring per worker is a patch leak: both threads read `original`
+    # themselves, so whichever starts second captures the stub the first just
+    # installed, and its `finally` puts that stub back as if it were the real
+    # method. The class is one object for the process, so the leak outlives T11
+    # and the next check runs against a stub that marks a run `done` without
+    # ever creating a session -- which is how T12 came to report 0 creates and a
+    # `done` run at the same time.
+    original_attempt_launch = rule_model._attempt_launch
+    rule_model._attempt_launch = record_launch
+    try:
+        for round_no in range(rounds):
+            del attempts[:]
+            barrier = threading.Barrier(2)
+            results = {}
 
-        def one(name):
-            """One drain worker: its own connection, its own cron-sized batch."""
-            try:
-                with registry.cursor() as cr:
-                    env = _env(cr)
-                    runs = env[run_model]
-                    # `_attempt_launch` lives on the RULE model -- it is one
-                    # attempt of a rule's launch, not a method of the run. The
-                    # class is looked up through the *registry*, not through
-                    # `type(env[...])`: Odoo builds a model class per registry,
-                    # so a class patched from this thread's environment would
-                    # not be the one the other thread's environment uses.
-                    rule_model = registry["turnstone.automation"]
-                    original = rule_model._attempt_launch
-                    rule_model._attempt_launch = record_launch
-                    try:
+            def one(name):
+                """One drain worker: its own connection, its own cron-sized batch."""
+                try:
+                    with registry.cursor() as cr:
+                        env = _env(cr)
+                        runs = env[run_model]
                         barrier.wait(timeout=30)
                         # Both workers see the WHOLE queue, so nothing is left
-                        # over simply because one worker's batch ended: the claim
-                        # alone decides who gets each run.
+                        # over simply because one worker's batch ended: the
+                        # claim alone decides who gets each run.
                         runs._drain_queue(limit=len(run_ids))
                         env.flush_all()
-                    finally:
-                        rule_model._attempt_launch = original
-                    cr.commit()
-                results[name] = "ok"
-            except Exception as exc:  # noqa: BLE001 - the point is to classify it
-                results[name] = "%s: %s" % (type(exc).__name__, str(exc).splitlines()[0])
+                        cr.commit()
+                    results[name] = "ok"
+                except Exception as exc:  # noqa: BLE001 - the point is to classify it
+                    results[name] = "%s: %s" % (
+                        type(exc).__name__, str(exc).splitlines()[0])
 
-        threads = [
-            threading.Thread(target=one, args=(name,)) for name in ("A", "B")
-        ]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(timeout=120)
+            threads = [
+                threading.Thread(target=one, args=(name,)) for name in ("A", "B")
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=120)
 
-        bad = {name: result for name, result in results.items() if result != "ok"}
-        if bad:
-            failures.append("round %d: a drain worker failed: %s" % (round_no, bad))
-        duplicated = sorted(
-            {run_id for run_id in attempts if attempts.count(run_id) > 1}
-        )
-        if duplicated:
-            failures.append(
-                "round %d: two workers launched the same run(s) %r"
-                % (round_no, duplicated)
+            bad = {name: result for name, result in results.items() if result != "ok"}
+            if bad:
+                failures.append("round %d: a drain worker failed: %s" % (round_no, bad))
+            duplicated = sorted(
+                {run_id for run_id in attempts if attempts.count(run_id) > 1}
             )
-        missing = sorted(set(run_ids) - set(attempts))
-        if missing:
-            failures.append(
-                "round %d: no worker launched run(s) %r" % (round_no, missing)
-            )
-        if verbose:
-            print("  T11 round %d: %d attempt(s) for %d run(s)"
-                  % (round_no, len(attempts), len(run_ids)))
-
-        # Refill the queue for the next round. A direct UPDATE because `write()`
-        # refuses to move a finished run back to `queued` -- the state graph is
-        # the guard under test elsewhere, and this is a fixture standing in for
-        # "the queue filled up again", not a behaviour being tested.
-        if round_no + 1 < rounds:
-            with registry.cursor() as cr:
-                cr.execute(
-                    """UPDATE turnstone_automation_run
-                          SET state = 'queued', attempt_count = 0,
-                              started_at = NULL, finished_at = NULL,
-                              session_id = NULL
-                        WHERE id = ANY(%s)""",
-                    [run_ids],
+            if duplicated:
+                failures.append(
+                    "round %d: two workers launched the same run(s) %r"
+                    % (round_no, duplicated)
                 )
-                cr.commit()
+            missing = sorted(set(run_ids) - set(attempts))
+            if missing:
+                failures.append(
+                    "round %d: no worker launched run(s) %r" % (round_no, missing)
+                )
+            if verbose:
+                print("  T11 round %d: %d attempt(s) for %d run(s)"
+                      % (round_no, len(attempts), len(run_ids)))
+
+            # Refill the queue for the next round. A direct UPDATE because
+            # `write()` refuses to move a finished run back to `queued` -- the
+            # state graph is the guard under test elsewhere, and this is a
+            # fixture standing in for "the queue filled up again", not a
+            # behaviour being tested.
+            if round_no + 1 < rounds:
+                with registry.cursor() as cr:
+                    cr.execute(
+                        """UPDATE turnstone_automation_run
+                              SET state = 'queued', attempt_count = 0,
+                                  started_at = NULL, finished_at = NULL,
+                                  session_id = NULL
+                            WHERE id = ANY(%s)""",
+                        [run_ids],
+                    )
+                    cr.commit()
+    finally:
+        rule_model._attempt_launch = original_attempt_launch
 
     return failures, {"runs": len(run_ids), "attempts": len(attempts)}
 
