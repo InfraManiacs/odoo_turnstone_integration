@@ -22,6 +22,21 @@ delivered". Odoo bookkeeping (`state`, `attempt_count`) is asserted alongside,
 never instead: a stale `queued` next to zero creates is a different bug from two
 creates, and a test that reads only the row cannot tell them apart.
 
+TWO PHASES, SO A CASE HAS TO DRIVE BOTH
+
+Since #5786 the launch is two-phase: `_attempt_launch()` commits the intent (the
+`draft` session whose id is the workstream id Turnstone is shown) and arms the
+delivery on `cr.postcommit`; only the delivery makes the HTTP call and marks the
+run `done`. A `TestCursor.commit()` **clears** `postcommit` instead of running
+it, and this module deliberately does not commit, so `_deliver_pending()` is
+what stands in for the commit here — it is the documented seam for exactly this
+case (`_deliver_pending`'s own docstring names the test cursor as its caller).
+
+That is not a weakening of the assertions, it is where the boundary now is: the
+create still has to happen exactly once, and it is still the server's log that
+says whether it did. `_attempt_launch` and `_deliver_queued_run` are both left
+real throughout.
+
 WHY A SECOND CONNECTION, AND WHAT IT CAN AND CANNOT PROVE
 
 `TransactionCase` hands out `TestCursor`s that share ONE connection behind a
@@ -53,6 +68,9 @@ from odoo.tests import tagged
 
 from odoo.addons.turnstone_integration.models.turnstone_automation_run import (
     DRAIN_LOCK_NAMESPACE,
+)
+from odoo.addons.turnstone_integration.models.turnstone_automation import (
+    LAUNCH_DELIVERY_LOCK_NAMESPACE,
 )
 
 from .common import TurnstoneTransactionCase
@@ -137,6 +155,17 @@ class QueueDrainCase(TurnstoneTransactionCase):
             if row["path"].endswith("/workstreams/new")
         ]
 
+    def _deliver(self):
+        """Run the phase-2 delivery this transaction armed. Stands in for commit.
+
+        #5786 moved the HTTP call to `cr.postcommit`, and a `TestCursor.commit()`
+        `clear()`s that queue rather than running it — so without this a drain
+        case would assert on zero creates and silently prove nothing about the
+        launch. `_deliver_pending()` is the documented seam for a test cursor; a
+        second call in one test is a no-op, because it pops the queue.
+        """
+        return self.env[RULE]._deliver_pending()
+
     def _other_session(self):
         """A second, genuinely separate database connection.
 
@@ -205,6 +234,7 @@ class TestTwoDrainsClaimOnce(QueueDrainCase):
             other.close()
 
         self.env[RUN]._drain_queue()
+        self._deliver()
 
         self.assertEqual(
             len(self._creates()), 1,
@@ -229,9 +259,16 @@ class TestTwoDrainsClaimOnce(QueueDrainCase):
         run = self._queued_run(rule, "event:twice")
 
         self.env[RUN]._drain_queue()
+        self._deliver()
         self.assertEqual(len(self._creates()), 1, "the first tick launches it")
 
-        self.env[RUN]._drain_queue()
+        # Another tick, and its delivery too: the run is done, so there must be
+        # nothing left to arm and nothing new on the server.
+        self.assertEqual(
+            self.env[RUN]._drain_queue().ids, [],
+            "the second tick's search must not even find the run",
+        )
+        self._deliver()
 
         self.assertEqual(
             len(self._creates()), 1,
@@ -240,6 +277,74 @@ class TestTwoDrainsClaimOnce(QueueDrainCase):
             "this transaction's cache would otherwise say it was still due",
         )
         self.assertEqual(len(self.mock.workstreams()), 1, "one event, one session")
+        run.invalidate_recordset()
+        self.assertEqual(run.state, "done", run.error)
+
+    def test_a_second_delivery_worker_sends_nothing_for_the_same_run(self):
+        """Phase 2's own claim: one run, one POST, whichever launcher gets there.
+
+        Since #5786 the HTTP call lives in `_deliver_queued_run()` rather than in
+        `_attempt_launch()`, and it is guarded by `_claim_delivery()` — a second
+        advisory try-lock, in its own namespace. The drain is one of the callers
+        that can reach it (a run left `queued` by a process that died between
+        commit and hook), so two launchers delivering one run is exactly the
+        double-prompt this module exists to catch.
+
+        A genuinely separate session holds that lock, which is what a competing
+        launcher's `_claim_delivery()` would hold. The loser must send nothing
+        and leave the run `queued` for the holder — not mark it `failed`, and not
+        invent a second workstream.
+
+        The run is given a real trigger record, and the body is passed rather
+        than re-rendered: `_queued_run_prompt()` refuses a run whose record is
+        gone (a webhook run cannot be reconstructed), and that refusal happens
+        *before* the claim — so a record-less run here would fail for the wrong
+        reason and prove nothing about the lock.
+        """
+        rule = self._rule(
+            # A target model, because this case hands the delivery a real record
+            # and `_render_prompt()` refuses a record of a model the rule does
+            # not watch. The prompt itself stays field-free, so the other cases'
+            # record-less runs still render.
+            target_model_id=self.env["ir.model"]._get("res.partner").id,
+        )
+        partner = self.env["res.partner"].create({"name": "Delivery Party"})
+        run = self._queued_run(
+            rule, "event:delivery",
+            trigger_res_model="res.partner", trigger_res_id=partner.id,
+        )
+        self.env[RUN]._drain_queue()
+
+        other = self._other_session()
+        try:
+            other.execute(
+                "SELECT pg_try_advisory_xact_lock(%s, %s)",
+                (LAUNCH_DELIVERY_LOCK_NAMESPACE, run.id),
+            )
+            self.assertTrue(
+                other.fetchone()[0],
+                "the stand-in launcher must actually hold the delivery lock",
+            )
+            rule._deliver_queued_run(run.id, body="Check the queue.")
+            self.assertEqual(
+                self._creates(), [],
+                "a run another launcher is delivering must not be POSTed a "
+                "second time — one event is one workstream",
+            )
+            run.invalidate_recordset()
+            self.assertEqual(
+                run.state, "queued",
+                "the loser must step back and leave the run to the holder; "
+                "failing it would report a delivery that never happened",
+            )
+        finally:
+            other.rollback()
+            other.close()
+
+        # The holder is gone; now the delivery lands, once.
+        rule._deliver_queued_run(run.id, body="Check the queue.")
+        self.assertEqual(len(self._creates()), 1)
+        self.assertEqual(len(self.mock.workstreams()), 1)
         run.invalidate_recordset()
         self.assertEqual(run.state, "done", run.error)
 
@@ -268,6 +373,7 @@ class TestFailedRunRetriesOnce(QueueDrainCase):
 
         with patch("urllib.request.urlopen", _ServerError()):
             self.env[RUN]._drain_queue()
+            self._deliver()
 
         run.invalidate_recordset()
         self.assertEqual(run.state, "failed")
@@ -278,16 +384,27 @@ class TestFailedRunRetriesOnce(QueueDrainCase):
             "for it to have created",
         )
 
+        # The next tick: nothing queued, nothing to arm, nothing sent — and the
+        # `urlopen` patch is gone, so a delivery here would really reach the
+        # mock. A drain that re-attempted the failed run would land a create.
         self.assertEqual(
             self.env[RUN]._drain_queue().ids, [],
             "a failed run is not queued, so the next tick has nothing to do "
             "with it — re-attempting it forever would bury the reason",
+        )
+        self._deliver()
+        self.assertEqual(
+            self._creates(), [],
+            "a failed run must not be re-processed by a later tick: nothing may "
+            "reach the server without the event being re-delivered",
         )
         run.invalidate_recordset()
         self.assertEqual(run.state, "failed")
         self.assertEqual(run.attempt_count, 1)
 
         retried = rule._launch_for_record(idempotency_key="event:retry")
+        self._deliver()
+        retried.invalidate_recordset()
 
         self.assertEqual(retried.id, run.id, "a retry reuses the event's run")
         self.assertEqual(retried.state, "done", retried.error)
@@ -317,6 +434,7 @@ class TestOnlyQueuedRunsAreDrained(QueueDrainCase):
         queued = self._queued_run(rule, "event:queued")
 
         attempted = self.env[RUN]._drain_queue()
+        self._deliver()
 
         self.assertEqual(
             attempted.ids, [queued.id],

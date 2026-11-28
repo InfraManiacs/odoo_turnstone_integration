@@ -24,6 +24,13 @@ asserts on the mock Turnstone server's request log: "fired once" is only worth
 anything if it means one prompt reached the server, and Odoo's own run table can
 say one thing while the server saw two creates.
 
+Since #5786 that launch is two-phase, so a case that asserts on the server drives
+both: `_drain_queue()` commits the intent and arms the HTTP on `cr.postcommit`,
+and `_deliver_pending()` is what runs it here — a `TestCursor.commit()` clears
+that queue instead of running it, exactly as `_deliver_pending`'s own docstring
+says. The create still has to happen exactly once; this only puts the assertion
+on the right side of the transaction boundary.
+
 WHY A FIXED `now`
 
 `_run_due_schedules(now=...)` takes the moment "due" is judged against — one
@@ -169,6 +176,18 @@ class TriggerScheduleCase(TurnstoneTransactionCase):
             if row["path"].endswith("/workstreams/new")
         ]
 
+    def _deliver(self):
+        """Run the phase-2 delivery this transaction armed. Stands in for commit.
+
+        #5786 split the launch: `_attempt_launch()` commits the intent and arms
+        the HTTP on `cr.postcommit`, and a `TestCursor.commit()` **clears** that
+        queue rather than running it. Without this every case below would see
+        zero creates and quietly prove nothing about the launch.
+        `_deliver_pending()` is the documented seam for a test cursor, and a
+        second call in one test is a no-op because it pops the queue.
+        """
+        return self.env[RULE]._deliver_pending()
+
 
 @tagged("post_install", "-at_install")
 class TestDueRecordFiresOncePerWindow(TriggerScheduleCase):
@@ -203,11 +222,13 @@ class TestDueRecordFiresOncePerWindow(TriggerScheduleCase):
         # The drain is the second half of "fired": a queued run is an intent, and
         # the prompt reaching the server is the event.
         self.env[RUN]._drain_queue()
+        self._deliver()
         self.assertEqual(
             len(self._creates()), 1,
             "one due record must produce one workstream-create on the server",
         )
         self.assertEqual(len(self.mock.workstreams()), 1)
+        queued.invalidate_recordset()
         self.assertEqual(queued.state, "done", queued.error)
 
     def test_a_second_drain_in_the_same_bucket_fires_nothing(self):
@@ -218,6 +239,7 @@ class TestDueRecordFiresOncePerWindow(TriggerScheduleCase):
 
         self.assertEqual(len(self._tick(now=now)), 1, "the first tick fires")
         self.env[RUN]._drain_queue()
+        self._deliver()
         creates_after_first = len(self._creates())
         self.assertEqual(creates_after_first, 1)
 
@@ -231,6 +253,7 @@ class TestDueRecordFiresOncePerWindow(TriggerScheduleCase):
                 "already been fired for and must not queue a second run" % minute,
             )
             self.env[RUN]._drain_queue()
+            self._deliver()
 
         self.assertEqual(
             len(self._creates()), 1,
@@ -251,11 +274,13 @@ class TestDueRecordFiresOncePerWindow(TriggerScheduleCase):
 
         first = self._tick(now=now)
         self.env[RUN]._drain_queue()
+        self._deliver()
         later = self._tick(now=now + timedelta(minutes=60))
 
         self.assertEqual(len(later), 1, "the next window is a new event")
         self.assertNotEqual(later.id, first.id, "and it gets its own run")
         self.env[RUN]._drain_queue()
+        self._deliver()
         self.assertEqual(
             len(self._creates()), 2,
             "a reminder that fires once and never again is not a reminder: the "
@@ -294,6 +319,7 @@ class TestNotDueFiresNothing(TriggerScheduleCase):
             "is due by its date and still not this rule's event",
         )
         self.env[RUN]._drain_queue()
+        self._deliver()
         self.assertEqual(
             len(self._creates()), 1,
             "the record outside the domain must not reach the server — one "
@@ -314,6 +340,7 @@ class TestNotDueFiresNothing(TriggerScheduleCase):
             "event for it",
         )
         self.env[RUN]._drain_queue()
+        self._deliver()
         self.assertEqual(
             self._creates(), [],
             "nothing may be launched for a record that is not due yet",
@@ -356,6 +383,7 @@ class TestNotDueFiresNothing(TriggerScheduleCase):
 
         self.assertEqual(self._tick(now=self._window_start(60)).ids, [])
         self.env[RUN]._drain_queue()
+        self._deliver()
         self.assertEqual(self._creates(), [])
         self.assertFalse(self._runs_of(rule))
 
@@ -366,6 +394,7 @@ class TestNotDueFiresNothing(TriggerScheduleCase):
 
         self.assertEqual(self._tick(now=self._window_start(60)).ids, [])
         self.env[RUN]._drain_queue()
+        self._deliver()
         self.assertEqual(self._creates(), [])
         self.assertFalse(self._runs_of(rule))
 
@@ -387,6 +416,7 @@ class TestWindowIsTheUnitsOfRepetition(TriggerScheduleCase):
 
         self.assertEqual(len(self._tick(now=now)), 1)
         self.env[RUN]._drain_queue()
+        self._deliver()
         creates = len(self._creates())
 
         for hours in (1, 24, 24 * 30):
@@ -395,6 +425,7 @@ class TestWindowIsTheUnitsOfRepetition(TriggerScheduleCase):
                 "with no window the record has already been handled",
             )
             self.env[RUN]._drain_queue()
+            self._deliver()
 
         self.assertEqual(len(self._creates()), creates)
         self.assertEqual(len(self._runs_of(rule)), 1)
@@ -428,6 +459,7 @@ class TestWindowIsTheUnitsOfRepetition(TriggerScheduleCase):
             "one day into a weekly window is still the same window",
         )
         self.env[RUN]._drain_queue()
+        self._deliver()
         self.assertEqual(len(self._creates()), 1)
 
     def test_two_ticks_a_second_apart_share_a_bucket(self):
