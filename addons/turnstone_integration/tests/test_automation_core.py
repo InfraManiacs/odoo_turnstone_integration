@@ -130,6 +130,25 @@ class AutomationCoreCase(TurnstoneTransactionCase):
     def _sessions_for(self, agent):
         return self.env["turnstone.session"].search([("agent_id", "=", agent.id)])
 
+    def _deliver(self):
+        """Deliver the launches this transaction armed, as the hook would.
+
+        Since OTI-5786 the launch is two-phase: `_launch_for_record()` commits
+        the intent (the run, and a `draft` session its workstream id derives
+        from) and POSTs nothing, and a post-commit hook makes the create on a
+        cursor of its own. So a successful launch returns the run `queued`.
+
+        The hook cannot fire in here: `TestCursor.commit()` **clears**
+        `postcommit` instead of running it, and a `TransactionCase` may not
+        commit at all. `_deliver_pending()` is the hook's own body — it pops the
+        jobs this transaction armed and drives `_deliver_queued_run()` for each —
+        so a case that asserts on the delivery drives it rather than asserting
+        `queued` and calling that success. Asserting `queued` alone would pass on
+        a launch whose POST never happened, which is the one thing this file
+        exists to catch.
+        """
+        return self.env["turnstone.automation"]._deliver_pending()
+
     # -- fixtures ----------------------------------------------------------
 
     def _rule_for_record(self, suffix="a"):
@@ -171,6 +190,7 @@ class TestSuccessfulLaunch(AutomationCoreCase):
 
     def test_a_launch_creates_one_session_and_one_run(self):
         run = self.rule._launch_for_record(idempotency_key="core-evt-1")
+        self._deliver()
 
         self.assertEqual(run.state, "done", run.error)
         self.assertEqual(run.attempt_count, 1, "one attempt, and it landed")
@@ -190,6 +210,37 @@ class TestSuccessfulLaunch(AutomationCoreCase):
         self.assertEqual(self._user_turns(workstreams[0]),
                          ["Summarise today's queue."])
 
+    def test_the_launch_is_queued_until_the_delivery_runs(self):
+        """The two-phase split, stated where the file's first criterion lives.
+
+        `queued` is not a weaker `done`: it is the state that says the intent is
+        committed and the remote call has not happened. Both halves are asserted
+        — nothing reaches the server before the delivery, and the prompt does
+        reach it after — because a case that only checked `queued` would pass on
+        a launch that never delivers at all.
+        """
+        run = self.rule._launch_for_record(idempotency_key="core-evt-queued")
+
+        self.assertEqual(run.state, "queued", run.error)
+        self.assertEqual(run.attempt_count, 0,
+                         "nothing has been tried until the delivery runs")
+        self.assertTrue(run.session_id, "the draft session is committed with the run")
+        self.assertFalse(run.session_id.ws_id,
+                         "and carries no workstream id until one is made")
+        self.assertEqual(self._creates(), [],
+                         "phase one makes no remote call at all")
+        self.assertEqual(self._workstreams(), [], "so the server holds nothing")
+
+        self._deliver()
+
+        self.assertEqual(run.state, "done", run.error)
+        self.assertEqual(len(self._creates()), 1)
+        self.assertEqual(
+            self._user_turns(self._workstreams()[0]),
+            ["Summarise today's queue."],
+            "and the prompt really arrived — `queued` alone would not prove it",
+        )
+
     def test_the_rule_counter_moves_once_per_launch(self):
         before = self.rule.run_count
         self.rule._launch_for_record(idempotency_key="core-count")
@@ -200,6 +251,7 @@ class TestSuccessfulLaunch(AutomationCoreCase):
     def test_the_same_prompt_arrives_verbatim_when_the_rule_has_no_record(self):
         """Scenario 5, second half: a prompt with no fields needs no record."""
         run = self.rule._launch_for_record(idempotency_key="core-norecord")
+        self._deliver()
 
         self.assertEqual(run.state, "done", run.error)
         self.assertEqual(
@@ -215,11 +267,13 @@ class TestDuplicateKey(AutomationCoreCase):
 
     def test_a_duplicate_key_does_not_launch_a_second_session(self):
         first = self.rule._launch_for_record(idempotency_key="core-dup")
+        self._deliver()
         creates_after_first = len(self._creates())
         self.assertEqual(first.state, "done", first.error)
 
         for _delivery in range(2):
             again = self.rule._launch_for_record(idempotency_key="core-dup")
+            self._deliver()
             self.assertEqual(again.id, first.id,
                              "a duplicate answers with the first run")
             self.assertEqual(again.state, "done")
@@ -244,6 +298,7 @@ class TestDuplicateKey(AutomationCoreCase):
         """The dedupe is per event, not a global "launch once, ever"."""
         first = self.rule._launch_for_record(idempotency_key="core-key-a")
         second = self.rule._launch_for_record(idempotency_key="core-key-b")
+        self._deliver()
 
         self.assertNotEqual(first.id, second.id)
         self.assertNotEqual(first.session_id, second.session_id)
@@ -307,15 +362,22 @@ class TestServerFailure(AutomationCoreCase):
         self.connection.api_token = "not-the-token-the-mock-was-started-with"
 
         run = self.rule._launch_for_record(idempotency_key="core-401")
+        self._deliver()
 
         self.assertEqual(run.state, "failed")
         self.assertEqual(run.attempt_count, 1, "an attempt was made, so it counts")
         self.assertIn("HTTP 401", run.error,
                       "the failure names what happened, not just that it failed")
-        self.assertFalse(run.session_id)
-        self.assertFalse(self._sessions_for(self.agent),
-                         "a failed launch leaves no half-written session")
-        self.assertEqual(self._workstreams(), [], "and no workstream on the server")
+        # The `draft` session survives a failed delivery on purpose (OTI-5786):
+        # its id derives the workstream id, so keeping it is what lets the retry
+        # of this event present the same id instead of minting a second
+        # workstream. What must not survive is any claim that one was made.
+        self.assertTrue(run.session_id,
+                        "the draft survives so the retry can reuse its id")
+        self.assertFalse(run.session_id.ws_id, "but no workstream was confirmed")
+        self.assertEqual(len(self._sessions_for(self.agent)), 1,
+                         "exactly one draft session, and it is the run's")
+        self.assertEqual(self._workstreams(), [], "and none on the server")
         self.assertNotIn(MOCK_TOKEN, run.error)
 
     def test_a_server_500_is_recorded_and_the_token_stays_out_of_the_run(self):
@@ -323,6 +385,7 @@ class TestServerFailure(AutomationCoreCase):
         body = "upstream said: Authorization: Bearer %s" % MOCK_TOKEN
         with patch("urllib.request.urlopen", ServerErrorTransport(body)):
             run = self.rule._launch_for_record(idempotency_key="core-500")
+            self._deliver()
 
         self.assertEqual(run.state, "failed")
         self.assertEqual(run.attempt_count, 1)
@@ -332,13 +395,15 @@ class TestServerFailure(AutomationCoreCase):
         self.assertNotIn(MOCK_TOKEN, run.error,
                          "the token must never reach a run history")
         self.assertIn("[redacted]", run.error)
-        self.assertFalse(run.session_id)
+        self.assertFalse(run.session_id.ws_id,
+                         "the delivery failed, so no workstream exists")
 
     def test_a_failed_run_is_visible_and_not_swallowed(self):
         """The launch never raises at a caller whose rollback would erase it."""
         self.connection.api_token = "not-the-token-the-mock-was-started-with"
 
         run = self.rule._launch_for_record(idempotency_key="core-visible")
+        self._deliver()
 
         self.assertTrue(run.exists(), "the failed run is committed, not in memory")
         self.assertTrue(run.error)
@@ -358,6 +423,7 @@ class TestPromptRendering(AutomationCoreCase):
         rule = self._rule_for_record(suffix="render")
 
         run = rule._launch_for_record(partner, idempotency_key="core-record")
+        self._deliver()
 
         self.assertEqual(run.state, "done", run.error)
         self.assertEqual(
@@ -374,6 +440,7 @@ class TestPromptRendering(AutomationCoreCase):
         rule = self._rule_for_record(suffix="name")
 
         run = rule._launch_for_record(partner, idempotency_key="core-name")
+        self._deliver()
 
         self.assertEqual(run.state, "done", run.error)
         self.assertEqual(run.session_id.name,

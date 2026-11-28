@@ -26,12 +26,19 @@ T10 A send must reach the remote exactly once when the transaction it was made
     that on a `SerializationFailure`, up to five times.
 T11 Two drain workers running the automation cron at the same time must not
     double-process a queued run: every run is attempted by exactly one worker.
+T12 A launch must reach the remote exactly once when the transaction it was made
+    in is rolled back and the handler re-run. Same defect as T10, on the launch
+    path, and T10's own fix could not cover it: the launch's idempotency token
+    was derived from a row the same transaction created, so a rollback destroyed
+    the token along with the intent (OTI-5786). T11's number was already taken by
+    the drain check above when this was added, so this is T12.
 
 Exit status is 0 only when all of them hold. Printed lines are the evidence; run it
 with `--verbose` for the per-round detail.
 """
 
 import argparse
+import contextlib
 import functools
 import os
 import sys
@@ -46,7 +53,6 @@ from odoo.addons.turnstone_integration.models.turnstone_client import (
     TurnstoneClient,
     TurnstoneConflict,
 )
-
 
 class CannedClient(TurnstoneClient):
     """A Turnstone whose answers are fixed, and which records what it was asked.
@@ -95,6 +101,35 @@ def _env(cr):
     return odoo.api.Environment(cr, odoo.SUPERUSER_ID, {})
 
 
+@contextlib.contextmanager
+def _patched_client(client):
+    """Route every `TurnstoneClient` API call to `client`, wherever it is built.
+
+    The four methods are patched on the **class**, not on
+    `turnstone.connection._client()`. The post-commit hook that delivers a launch
+    opens a cursor of its own and builds a fresh environment from it, so a patch
+    on a model class reached through the caller's environment is not guaranteed
+    to be the one that environment resolves — and when it is not, the real client
+    runs against a stub URL and the check measures nothing. `TurnstoneClient` is
+    one class object for the whole process, so patching its methods reaches every
+    environment, including the hook's.
+
+    Patching `__init__` is not enough and was tried: the class stays
+    `TurnstoneClient`, so copying the canned instance's `__dict__` gives it the
+    stub's *attributes* but not its *methods*, and the real `create_session`
+    opens a socket.
+    """
+    def delegate(name):
+        def call(self, *args, **kwargs):
+            return getattr(client, name)(*args, **kwargs)
+        return call
+
+    with contextlib.ExitStack() as stack:
+        for name in ("create_session", "session_detail", "send", "cluster_workstreams"):
+            stack.enter_context(patch.object(TurnstoneClient, name, delegate(name)))
+        yield client
+
+
 def _session(env, name, **vals):
     connection = env["turnstone.connection"].search([], limit=1)
     if not connection:
@@ -133,30 +168,44 @@ def t9_concurrent_syncs(registry, session_id, rounds, verbose):
         barrier = threading.Barrier(2)
         results = {}
 
+        # The patch wraps the round, not each worker. Entered per worker it is a
+        # leak: two threads entering `patch.object` on ONE class means the
+        # second saves the first's stub as "the original", so unwinding puts the
+        # stub back and `_client` stays patched for the rest of the process.
+        # The next check then gets a canned client instead of its own and
+        # silently measures nothing -- T12 read 0 creates and a `done` run at
+        # once because of exactly this.
+        local = threading.local()
+
         def one(name):
             """One request: its own cursor, its own client, one commit."""
+            local.client = clients.setdefault(name, CannedClient(messages))
             try:
                 with registry.cursor() as cr:
                     env = _env(cr)
                     session = env["turnstone.session"].browse(session_id)
-                    client = clients.setdefault(name, CannedClient(messages))
-                    with patch.object(
-                        type(session.connection_id), "_client",
-                        lambda self, timeout=None: client,
-                    ):
-                        barrier.wait(timeout=30)
-                        session.sync_from_server()
-                        env.flush_all()
+                    barrier.wait(timeout=30)
+                    session.sync_from_server()
+                    env.flush_all()
                     cr.commit()
                 results[name] = "ok"
             except Exception as exc:  # noqa: BLE001 - the point is to classify it
                 results[name] = "%s: %s" % (type(exc).__name__, str(exc).splitlines()[0])
+            finally:
+                del local.client
 
-        threads = [threading.Thread(target=one, args=(n,)) for n in ("A", "B")]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(timeout=120)
+        # The stub is per thread (`threading.local`), because both workers patch
+        # the same class method: which canned answer a call gets has to be
+        # decided by who is calling, not by an argument it happens to carry.
+        with patch.object(
+            registry["turnstone.connection"], "_client",
+            lambda self, timeout=None: local.client,
+        ):
+            threads = [threading.Thread(target=one, args=(n,)) for n in ("A", "B")]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=120)
         bad = {n: r for n, r in results.items() if r != "ok"}
         if bad:
             failures.append("round %d: %s" % (round_no, bad))
@@ -331,86 +380,260 @@ def t11_concurrent_drains(registry, run_count, rounds, verbose):
         run._mark_running()
         run._mark_done()
 
-    for round_no in range(rounds):
-        del attempts[:]
-        barrier = threading.Barrier(2)
-        results = {}
+    # `_attempt_launch` lives on the RULE model -- it is one attempt of a rule's
+    # launch, not a method of the run. The class is looked up through the
+    # *registry*, not through `type(env[...])`: Odoo builds a model class per
+    # registry, so a class patched from one thread's environment would not be
+    # the one the other thread's environment uses.
+    rule_model = registry["turnstone.automation"]
+    # Saved and restored AROUND the whole round loop, not inside each worker.
+    # Restoring per worker is a patch leak: both threads read `original`
+    # themselves, so whichever starts second captures the stub the first just
+    # installed, and its `finally` puts that stub back as if it were the real
+    # method. The class is one object for the process, so the leak outlives T11
+    # and the next check runs against a stub that marks a run `done` without
+    # ever creating a session -- which is how T12 came to report 0 creates and a
+    # `done` run at the same time.
+    original_attempt_launch = rule_model._attempt_launch
+    rule_model._attempt_launch = record_launch
+    try:
+        for round_no in range(rounds):
+            del attempts[:]
+            barrier = threading.Barrier(2)
+            results = {}
 
-        def one(name):
-            """One drain worker: its own connection, its own cron-sized batch."""
-            try:
-                with registry.cursor() as cr:
-                    env = _env(cr)
-                    runs = env[run_model]
-                    # `_attempt_launch` lives on the RULE model -- it is one
-                    # attempt of a rule's launch, not a method of the run. The
-                    # class is looked up through the *registry*, not through
-                    # `type(env[...])`: Odoo builds a model class per registry,
-                    # so a class patched from this thread's environment would
-                    # not be the one the other thread's environment uses.
-                    rule_model = registry["turnstone.automation"]
-                    original = rule_model._attempt_launch
-                    rule_model._attempt_launch = record_launch
-                    try:
+            def one(name):
+                """One drain worker: its own connection, its own cron-sized batch."""
+                try:
+                    with registry.cursor() as cr:
+                        env = _env(cr)
+                        runs = env[run_model]
                         barrier.wait(timeout=30)
                         # Both workers see the WHOLE queue, so nothing is left
-                        # over simply because one worker's batch ended: the claim
-                        # alone decides who gets each run.
+                        # over simply because one worker's batch ended: the
+                        # claim alone decides who gets each run.
                         runs._drain_queue(limit=len(run_ids))
                         env.flush_all()
-                    finally:
-                        rule_model._attempt_launch = original
-                    cr.commit()
-                results[name] = "ok"
-            except Exception as exc:  # noqa: BLE001 - the point is to classify it
-                results[name] = "%s: %s" % (type(exc).__name__, str(exc).splitlines()[0])
+                        cr.commit()
+                    results[name] = "ok"
+                except Exception as exc:  # noqa: BLE001 - the point is to classify it
+                    results[name] = "%s: %s" % (
+                        type(exc).__name__, str(exc).splitlines()[0])
 
-        threads = [
-            threading.Thread(target=one, args=(name,)) for name in ("A", "B")
-        ]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(timeout=120)
+            threads = [
+                threading.Thread(target=one, args=(name,)) for name in ("A", "B")
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=120)
 
-        bad = {name: result for name, result in results.items() if result != "ok"}
-        if bad:
-            failures.append("round %d: a drain worker failed: %s" % (round_no, bad))
-        duplicated = sorted(
-            {run_id for run_id in attempts if attempts.count(run_id) > 1}
-        )
-        if duplicated:
-            failures.append(
-                "round %d: two workers launched the same run(s) %r"
-                % (round_no, duplicated)
+            bad = {name: result for name, result in results.items() if result != "ok"}
+            if bad:
+                failures.append("round %d: a drain worker failed: %s" % (round_no, bad))
+            duplicated = sorted(
+                {run_id for run_id in attempts if attempts.count(run_id) > 1}
             )
-        missing = sorted(set(run_ids) - set(attempts))
-        if missing:
-            failures.append(
-                "round %d: no worker launched run(s) %r" % (round_no, missing)
-            )
-        if verbose:
-            print("  T11 round %d: %d attempt(s) for %d run(s)"
-                  % (round_no, len(attempts), len(run_ids)))
-
-        # Refill the queue for the next round. A direct UPDATE because `write()`
-        # refuses to move a finished run back to `queued` -- the state graph is
-        # the guard under test elsewhere, and this is a fixture standing in for
-        # "the queue filled up again", not a behaviour being tested.
-        if round_no + 1 < rounds:
-            with registry.cursor() as cr:
-                cr.execute(
-                    """UPDATE turnstone_automation_run
-                          SET state = 'queued', attempt_count = 0,
-                              started_at = NULL, finished_at = NULL,
-                              session_id = NULL
-                        WHERE id = ANY(%s)""",
-                    [run_ids],
+            if duplicated:
+                failures.append(
+                    "round %d: two workers launched the same run(s) %r"
+                    % (round_no, duplicated)
                 )
-                cr.commit()
+            missing = sorted(set(run_ids) - set(attempts))
+            if missing:
+                failures.append(
+                    "round %d: no worker launched run(s) %r" % (round_no, missing)
+                )
+            if verbose:
+                print("  T11 round %d: %d attempt(s) for %d run(s)"
+                      % (round_no, len(attempts), len(run_ids)))
+
+            # Refill the queue for the next round. A direct UPDATE because
+            # `write()` refuses to move a finished run back to `queued` -- the
+            # state graph is the guard under test elsewhere, and this is a
+            # fixture standing in for "the queue filled up again", not a
+            # behaviour being tested.
+            if round_no + 1 < rounds:
+                with registry.cursor() as cr:
+                    cr.execute(
+                        """UPDATE turnstone_automation_run
+                              SET state = 'queued', attempt_count = 0,
+                                  started_at = NULL, finished_at = NULL,
+                                  session_id = NULL
+                            WHERE id = ANY(%s)""",
+                        [run_ids],
+                    )
+                    cr.commit()
+    finally:
+        rule_model._attempt_launch = original_attempt_launch
 
     return failures, {"runs": len(run_ids), "attempts": len(attempts)}
 
+
+
+def t12_launch_under_retry(registry, verbose):
+    """One launch, re-run the way `retrying()` re-runs it. Must reach the remote once.
+
+    T10's defect, on the launch path. A send's workstream id derives from a
+    session row that **pre-exists** its transaction, so a rollback leaves the
+    token intact and the re-run presents the same id. A launch's did not: the
+    session row was created in the same transaction, so a rollback took the id
+    with it, the re-run minted a new one, the proxy had nothing to answer 409
+    about, and a second workstream carrying the same prompt was created.
+
+    Two things make this a script rather than a test case, and both are the same
+    reason T10 is here. It needs a **real** `rollback()`, which a
+    `TransactionCase` patches to raise (`odoo/tests/common.py`), and it needs a
+    real `commit()` to fire the post-commit hook that phase two runs on. In a test
+    case `TestCursor.commit()` *clears* `postcommit` instead of running it, so a
+    launch there never delivers at all — which is why the module drives
+    `_deliver_pending()` by hand. Neither substitute can show this defect: the
+    whole question is what survives a transaction boundary, and there is no
+    boundary inside one cursor.
+
+    The stub stands in for the network only. The launch service, its two-phase
+    split, `_arm_delivery()`, the real post-commit hook and `_deliver_queued_run()`
+    all run, and `created` is shared across the two attempts so the stub's 409
+    behaves like the real proxy's: a repeat of an id it already made is refused,
+    a new id is accepted. That is what makes the count below mean "one workstream
+    or two", not merely "create was called twice".
+    """
+    created = {}
+    calls = []
+    # Unique per invocation, because the script leaves its rows behind: a fixed
+    # key would find the previous run's `done` row, answer the launch with it as
+    # a duplicate, and pass while measuring nothing.
+    key = "launch-retry-check:%s" % int(time.time() * 1000)
+
+    with registry.cursor() as cr:
+        env = _env(cr)
+        connection = env["turnstone.connection"].search([], limit=1)
+        if not connection:
+            connection = env["turnstone.connection"].create({
+                "name": "concurrency check",
+                "base_url": "http://stub.invalid",
+                "api_token": "stub-token",
+                "is_default": True,
+            })
+        # Re-entrant, for the same reason T11 is: the diagnostic leaves its
+        # fixtures behind and a second run has to be able to start.
+        env["turnstone.automation"].with_context(active_test=False).search([
+            ("name", "like", "concurrency check: launch retry rule"),
+        ]).unlink()
+        env["turnstone.agent"].search([
+            ("name", "like", "launch retry check agent"),
+        ]).unlink()
+        cr.commit()
+        agent = env["turnstone.agent"].create({
+            "name": "launch retry check agent %s" % key,
+            "connection_id": connection.id,
+            "kind": "interactive",
+        })
+        rule = env["turnstone.automation"].create({
+            "name": "concurrency check: launch retry rule %s" % key,
+            "company_id": env.company.id,
+            "agent_id": agent.id,
+            "trigger_type": "manual",
+            "prompt_template": "Launch retry check.",
+            "run_as": "fixed_user",
+            "run_as_user_id": env.user.id,
+        })
+        rule_id = rule.id
+        cr.commit()
+
+    def attempt(roll_back):
+        """One run of the handler. Both attempts share one stub and its state.
+
+        Two details are load-bearing and were both got wrong first:
+
+        * the cursor is managed by hand, not with `with registry.cursor()`.
+          `Cursor.__exit__` **commits** on a clean exit, so returning after
+          `cr.rollback()` from inside a `with` block would commit the very
+          transaction that was just rolled back and run the delivery anyway --
+          the check would silently become a test of the commit path.
+        * the client patch wraps the `cr.commit()` too. The delivery's calls are
+          made by the post-commit hook **during** that commit, so a patch that
+          had already exited would let the real client run against the stub URL
+          and the check would measure nothing.
+        """
+        client = CannedClient([], created=created)
+        with _patched_client(client):
+            cr = registry.cursor()
+            try:
+                env = _env(cr)
+                rule = env["turnstone.automation"].browse(rule_id)
+                rule._launch_for_record(idempotency_key=key)
+                if roll_back:
+                    # `service.model.retrying()` rolls the transaction back and
+                    # re-runs the whole handler. `rollback()` clears
+                    # `cr.postcommit`, so the armed delivery never runs and no
+                    # create is made -- the guarantee under test. The run row
+                    # goes with it, which is why the re-run is not a duplicate.
+                    cr.rollback()
+                else:
+                    # A committed launch: the hook fires on commit, in a cursor
+                    # of its own, exactly as it does in production.
+                    cr.commit()
+            finally:
+                # Never commits on the way out: a rolled-back attempt stays
+                # rolled back, and a committed one has nothing left to say.
+                cr.close()
+        calls.extend(client.calls)
+
+    attempt(roll_back=True)
+    attempt(roll_back=False)
+
+    failures = []
+    # The run is re-read **by key**, not taken from `_launch_for_record()`'s
+    # return value: the service returns an empty recordset on the retry path when
+    # it loses the row-lock claim, which is correct for its callers and not what
+    # this check is about. What it is about is what ended up in the database and
+    # at the remote.
+    with registry.cursor() as cr:
+        env = _env(cr)
+        run = env["turnstone.automation.run"].sudo().search([
+            ("automation_id", "=", rule_id),
+            ("idempotency_key", "=", key),
+        ], limit=1)
+        if not run:
+            failures.append(
+                "the re-run left no run row at all for key %r; the event was "
+                "lost, which a rollback-retry must never do" % key
+            )
+            return failures, {"creates": 0, "workstreams": len(created)}
+        # Read inside the block: the recordset's cursor is closed when it exits,
+        # and a lazy field read afterwards raises "Cursor already closed" instead
+        # of telling us what happened.
+        state, error = run.state, run.error or ""
+        adopted_ws_id = run.session_id.ws_id or None
+
+    creates = [c for c in calls if c[0] == "create"]
+    unnamed = [c for c in creates if c[1] is None]
+    if unnamed:
+        failures.append(
+            "%d create(s) presented no ws_id at all, so the remote had nothing "
+            "to recognise a repeat by: %r" % (len(unnamed), unnamed)
+        )
+    if len(created) != 1:
+        failures.append(
+            "the remote ended up with %d workstream(s) for one logical launch: %r"
+            % (len(created), list(created))
+        )
+    if state != "done":
+        failures.append(
+            "the re-run did not deliver the launch (run is %r: %s)" % (state, error)
+        )
+    made = (list(created) or [None])[0]
+    if made is not None and adopted_ws_id != made:
+        failures.append(
+            "the run did not adopt the workstream that was made (row says %r, "
+            "remote made %r)" % (adopted_ws_id, made)
+        )
+    if verbose:
+        print("  T12 calls: %r" % (calls,))
+        print("  T12 workstreams made: %d" % len(created))
+        print("  T12 final run: %r" % (state,))
+    return failures, {"creates": len(creates), "workstreams": len(created)}
 
 
 def _exit(status):
@@ -466,6 +689,13 @@ def main():
     print("T11 %s (%d run(s), last round attempted %d)"
           % ("PASS: every run attempted exactly once" if not found else "FAIL",
              stats["runs"], stats["attempts"]))
+
+    print("T12 a launch must reach the remote exactly once under a transaction retry")
+    found, stats = t12_launch_under_retry(registry, args.verbose)
+    failures.extend(found)
+    print("T12 %s (%d create call(s), %d workstream(s) at the remote)"
+          % ("PASS: one launch, one workstream, the re-run delivered it" if not found
+             else "FAIL", stats["creates"], stats["workstreams"]))
 
     if failures:
         print("\nFAILED:")

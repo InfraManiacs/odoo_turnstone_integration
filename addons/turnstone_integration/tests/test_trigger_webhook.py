@@ -49,8 +49,19 @@ replay. (It did, on the first run of this file: both cases failed for exactly
 that reason.)
 
 So the fixture points at the mock, exactly as `test_automation_launch.py` does,
-and a run reaches `done`. Whether the launch itself works is that file's subject;
-nothing here asserts on the session it creates.
+and a run reaches `done` once its delivery is driven. Whether the launch itself
+works is that file's subject; nothing here asserts on the session it creates.
+
+SINCE OTI-5786 THE DELIVERY IS A SECOND PHASE
+
+The route commits an intent (`queued` run + `draft` session) and a post-commit
+hook makes the create afterwards, so that a handler retry cannot start a second
+workstream. The route's own `commit()` fires that hook in production; an
+`HttpCase`'s `TestCursor.commit()` clears `postcommit` instead of running it, so
+every positive case here captures the armed launch and delivers it — the hook's
+own body — before asserting on the run. A case that asserted `queued` instead
+would pass on a delivery that never happened, which is exactly what the positive
+half exists to prove.
 """
 
 import hashlib
@@ -58,6 +69,7 @@ import hmac
 import json
 import os
 import time
+from unittest.mock import patch
 
 from odoo.tests import HttpCase, tagged
 
@@ -155,6 +167,51 @@ class WebhookCase(HttpCase):
     def _runs(self, rule):
         return self.env[RUN].sudo().search([("automation_id", "=", rule.id)])
 
+    def _captured_delivery(self):
+        """Capture the launch a webhook delivery arms, so the case can deliver it.
+
+        Since OTI-5786 a launch is two-phase: the route commits the intent (the
+        run, and a `draft` session its workstream id derives from) and a
+        post-commit hook makes the create on a cursor of its own. In production
+        the route's `commit()` fires that hook.
+
+        In an `HttpCase` it does not, and `_deliver_pending()` cannot stand in for
+        it: `TestCursor.commit()` **clears** `postcommit` instead of running it,
+        so by the time a case has the response the route's armed job is already
+        gone from this cursor's queue. So the job is captured at
+        `_arm_delivery()` — the production method, unpatched otherwise — and
+        replayed through `_deliver_armed()`, which is the hook's own body.
+
+        Used as::
+
+            with self._captured_delivery() as armed:
+                response = self._deliver(rule, {...})
+            self._deliver_captured(armed)
+
+        Asserting `queued` instead would pass on a delivery that never happened,
+        which is the one thing the positive cases exist to catch.
+        """
+        armed = []
+        model = type(self.env["turnstone.automation"])
+        original = model._arm_delivery
+
+        def capture(automation, run, session, body):
+            result = original(automation, run, session, body)
+            armed.append((run.id, body))
+            return result
+
+        return armed, patch.object(model, "_arm_delivery", capture)
+
+    def _deliver_captured(self, armed):
+        """Run the captured jobs through the hook's own body, then re-read."""
+        if not armed:
+            raise AssertionError(
+                "the delivery armed no launch job at all — the route never got "
+                "as far as committing an intent, so there is nothing to deliver"
+            )
+        self.env["turnstone.automation"]._deliver_armed(list(armed))
+        self.env.invalidate_all()
+
     # -- speaking the contract ---------------------------------------------
 
     @staticmethod
@@ -210,9 +267,11 @@ class TestAcceptedDelivery(WebhookCase):
     def test_a_signed_delivery_is_accepted_and_records_one_run(self):
         rule = self._rule()
 
-        response = self._deliver(
-            rule, {"event_id": "evt-1", "ticket": "TCK-7"}, event_id="evt-1",
-        )
+        armed, patch_arm = self._captured_delivery()
+        with patch_arm:
+            response = self._deliver(
+                rule, {"event_id": "evt-1", "ticket": "TCK-7"}, event_id="evt-1",
+            )
 
         self.assertEqual(
             response.status_code, 202,
@@ -220,6 +279,11 @@ class TestAcceptedDelivery(WebhookCase):
             % response.text[:400],
         )
         self.assertEqual(response.json(), {"status": "accepted"})
+        # The route commits an intent and the delivery follows; in production the
+        # route's own commit fires it. An `HttpCase` clears `postcommit` instead,
+        # so it is driven here — see `_captured_delivery()`. Asserting `queued`
+        # instead would pass on a launch whose POST never happened.
+        self._deliver_captured(armed)
         runs = self._runs(rule)
         self.assertEqual(len(runs), 1, "one delivery must record exactly one run")
         self.assertEqual(
@@ -483,8 +547,17 @@ class TestReplayAndRuleState(WebhookCase):
         })
         rule = self._rule(agent_id=dead_agent.id)
 
-        first = self._deliver(rule, {"event_id": "evt-retry"}, event_id="evt-retry")
+        armed, patch_arm = self._captured_delivery()
+        with patch_arm:
+            first = self._deliver(
+                rule, {"event_id": "evt-retry"}, event_id="evt-retry",
+            )
         self.assertEqual(first.status_code, 202, first.text[:400])
+        # Driven, because `HttpCase` clears `postcommit` rather than running the
+        # hook: without this the run would still be `queued`, and `queued` is not
+        # the `failed` this case needs to see. The closed port is what must make
+        # it fail, not a missing delivery.
+        self._deliver_captured(armed)
         run = self._runs(rule)
         self.assertEqual(
             run.state, "failed",
@@ -492,9 +565,12 @@ class TestReplayAndRuleState(WebhookCase):
             "otherwise this case proves nothing about a retry",
         )
 
-        response = self._deliver(
-            rule, {"event_id": "evt-retry"}, event_id="evt-retry",
-        )
+        armed, patch_arm = self._captured_delivery()
+        with patch_arm:
+            response = self._deliver(
+                rule, {"event_id": "evt-retry"}, event_id="evt-retry",
+            )
+        self._deliver_captured(armed)
 
         self.assertEqual(
             response.status_code, 202,
