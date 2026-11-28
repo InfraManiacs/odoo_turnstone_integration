@@ -43,7 +43,7 @@ from datetime import timedelta
 
 from psycopg2 import errors as psycopg2_errors
 
-from odoo import _, api, fields, models
+from odoo import SUPERUSER_ID, _, api, fields, models
 from odoo.exceptions import ConcurrencyError, UserError, ValidationError
 from odoo.fields import Domain
 from odoo.tools import html2plaintext
@@ -146,6 +146,18 @@ RUN_KEY_CONSTRAINT = "turnstone_automation_run_run_key_uniq"
 #: the second is the rule id: nothing else in the database can collide with it,
 #: and it needs no table. See `_webhook_lock()`.
 WEBHOOK_LOCK_NAMESPACE = 0x54535742  # "TSWB", well inside int4
+
+
+#: Advisory-lock namespace for "one launcher is delivering this run". Same shape
+#: as `WEBHOOK_LOCK_NAMESPACE`: advisory locks are keyed by two int4s, the first is
+#: this module's own constant and the second is the run id, so nothing else in the
+#: database can collide with it and it needs no table. See `_claim_delivery()`.
+LAUNCH_DELIVERY_LOCK_NAMESPACE = 0x54534C44  # "TSLD", well inside int4
+
+#: `cr.postcommit.data` key holding the launches this transaction armed for
+#: delivery: a list of `(run_id, body)`. One key, one callback, however many
+#: launches the transaction made — see `_arm_delivery()`.
+DELIVERY_JOBS_KEY = "turnstone_integration.launch.jobs"
 
 
 class WebhookRefused(Exception):
@@ -987,9 +999,15 @@ class TurnstoneAutomation(models.Model):
         `run.state` and `run.error`:
 
         * `failed` with `attempt_count == 0` — refused before anything was
-          tried: no permission, no company, a prompt that would not render.
+          tried: no permission, no company, a record of another company, a
+          prompt that would not render, a prompt that **rendered to nothing**
+          (a template of only placeholders against a blank field).
         * `failed` with an odd count — an attempt was made and did not land.
         * `skipped` — the event arrived and the rule's own window suppressed it.
+        * `queued` — the intent is committed (this run, and the `draft` session its
+          workstream id is derived from) and the delivery has not finished yet.
+          The launch delivers after this transaction commits, so this is what a
+          successful launch looks like on the way out — see `_attempt_launch()`.
         * `done` — a session exists and the prompt was delivered to it.
 
         ``record``
@@ -998,6 +1016,18 @@ class TurnstoneAutomation(models.Model):
             default the dedupe token. `webhook` and `manual` rules launch with
             no record; a prompt that uses `{{ }}` then fails, because there is
             nothing to fill it from.
+
+            **The caller owes the record's company.** For a model that carries
+            a `company_id`, the record must belong to this rule's company:
+            a record of another company is refused here as a `failed` run with
+            `attempt_count == 0`, rather than rendering that company's field
+            values into the prompt of a session attributed to this one. A
+            record whose company is empty is *shared* — Odoo's meaning: every
+            company may use the row — and is accepted, as is a model with no
+            `company_id` at all. The trigger adapters filter records through
+            `turnstone.trigger.record._company_ok()` before queueing a run;
+            this check is the service enforcing the same wall so that an
+            adapter is never the only line of defence (OTI-5788).
         ``triggering_user``
             Who caused it, used only when the rule runs as `triggering_user`.
             A cron or a webhook passes nothing and the rule's own run-as setting
@@ -1011,7 +1041,10 @@ class TurnstoneAutomation(models.Model):
             is coarser than one record.
         ``prompt``
             Overrides the rendered template. The rendered prompt is untrusted
-            content either way: it travels only as the message body.
+            content either way: it travels only as the message body. An
+            override is subject to the same emptiness check as a render — an
+            explicit `""` would otherwise start a workstream with no
+            instruction and report `done` (OTI-5789).
 
         A repeat call with the same key is answered with the run the first call
         produced and sends nothing — except when that run is `failed`. A failed
@@ -1114,13 +1147,46 @@ class TurnstoneAutomation(models.Model):
         )
 
     def _attempt_launch(self, run, record, triggering_user, prompt):
-        """One attempt at delivering this run's prompt. Returns the run."""
+        """One attempt at delivering this run's prompt. Returns the run.
+
+        Two phases, and where the line between them falls is the whole of
+        OTI-5786:
+
+        1. **Here, in the caller's transaction** — permission, prompt, and the
+           intent rows: this run, and a `draft` session carrying no `ws_id`.
+           No HTTP.
+        2. **After that transaction commits** — `_arm_delivery()` schedules
+           `_deliver_queued_run()` on a cursor of its own: the create call, then
+           `ws_id` and state written back in a second transaction.
+
+        Why the split is load-bearing. The workstream id presented to Turnstone
+        is derived from the session row's own id
+        (`turnstone.session._client_ws_id()`), and that derivation is only an
+        idempotency token if the id is **already durable** when the POST is
+        made. Minted inside the caller's transaction it was not: Odoo re-runs a
+        JSON-RPC handler up to five times on a `SerializationFailure`
+        (`service.model.retrying()`), and `ir.cron` retries a job the same way.
+        A rollback after the POST therefore left the re-run with a session row
+        that had never existed, a fresh id, and a fresh `ws_id` — so the 409 the
+        routing proxy answers for a repeated id could never fire, and the same
+        prompt started two workstreams. Committing the intent first removes the
+        window instead of narrowing it: a rollback now discards an attempt that
+        never happened, and every id Turnstone is ever shown for one event was
+        committed before the request that carried it. A re-run after a rollback
+        mints a new row, sends nothing, and delivers once.
+        """
         # 4. Who is this for? Refused before a session exists and before any
         #    HTTP, and recorded on the run: a permission problem is exactly what
         #    a person investigating "why did this not fire" needs to see.
+        #    The record's company is checked here too, and after the owner:
+        #    an unauthorized user must not learn anything about the record, and
+        #    this is the one attempt path both `_launch_for_record()` and the
+        #    drain go through, so the wall holds for a caller that skipped the
+        #    adapters' own filter.
         try:
             owner = self._resolve_run_as_user(triggering_user)
             self._check_launch_allowed(owner)
+            self._check_record_company(record)
         except UserError as exc:
             _logger.info("Automation %s refused run %s: %s", self.name, run.id, exc)
             return self._fail_run(run, exc)
@@ -1135,18 +1201,35 @@ class TurnstoneAutomation(models.Model):
                 self.name, run._clean_text(exc),
             )
             return self._fail_run(run, exc)
+
+        # 5b. The render can succeed and still carry no instruction (OTI-5789).
+        #     `_check_prompt_template()` validates the TEMPLATE, which is a
+        #     different promise: `{{ email }}` is a good template and a record
+        #     with no email renders it to `""`. Sending that starts a
+        #     workstream with no prompt in it (`create_session()` gates
+        #     `initial_message` on truthiness) and marks the run `done`, whose
+        #     meaning is "a session exists AND the prompt was delivered to it".
+        #     Refused here, so there is no session row, nothing is armed and no
+        #     HTTP is made; `attempt_count` stays 0 because nothing was tried.
+        try:
+            self._check_rendered_prompt(body)
+        except UserError as exc:
+            _logger.warning(
+                "Automation %s refused run %s: the prompt rendered to nothing.",
+                self.name, run.id,
+            )
+            return self._fail_run(run, exc)
         run._record_prompt(body)
 
-        # 6. Launch. The attempt is counted before the call, so a crash in the
-        #    middle leaves an honest `running` rather than a run still claiming
-        #    never to have tried. The savepoint matters: a database-level
-        #    failure inside the session create would otherwise leave the
-        #    transaction unusable and the failure could never be written down.
-        run._mark_running()
+        # 6. Commit the intent, and only the intent. The session row is created
+        #    here — not in the delivery, which runs after this transaction is
+        #    gone — because its id is the workstream id Turnstone is shown, and
+        #    that has to be durable before the POST. `_mark_running()` is
+        #    deliberately NOT called: nothing has been tried yet, and a run that
+        #    counted an attempt before the request that makes it would lie about
+        #    a delivery that a rollback then erased.
         try:
-            with self.env.cr.savepoint():
-                session = self._create_launch_session(owner, record)
-                session._ensure_started(first_message=body)
+            session = self._launch_session(run, owner, record)
         except Exception as exc:  # noqa: BLE001 - see the class docstring on errors
             # The log line is as exposed as the run history: a log aggregator is
             # read by more people than a connection is, and the exception a 500
@@ -1155,18 +1238,270 @@ class TurnstoneAutomation(models.Model):
             secrets = self._launch_secrets()
             cleaned = run._clean_text(exc, secrets)
             _logger.warning(
-                "Automation %s: run %s failed to launch: %s", self.name, run.id, cleaned,
+                "Automation %s: run %s could not be prepared: %s",
+                self.name, run.id, cleaned,
+            )
+            return run._mark_failed(exc, secrets=secrets)
+
+        run.write({"session_id": session.id})
+        self._arm_delivery(run, session, body)
+        return run
+
+    def _launch_session(self, run, owner, record=None):
+        """The `draft` session this run will send its prompt from. Has no `ws_id`.
+
+        Reused when the run already has one. That is what a retry sees: the
+        session was committed with the run, so its id — and therefore the
+        workstream id derived from it — is the SAME across every later attempt
+        (the post-commit delivery of this call, a cron drain, a retry in another
+        process). Re-minting it per attempt would give each attempt a new
+        idempotency token and re-open exactly the duplicate this ticket is
+        about.
+        """
+        self.ensure_one()
+        run.ensure_one()
+        if run.session_id:
+            return run.session_id
+        return self._create_launch_session(owner, record)
+
+    def _arm_delivery(self, run, session, body):
+        """Schedule this run's delivery for after the caller's transaction commits.
+
+        Phase two of the launch, and the reason `_attempt_launch()` commits the
+        intent (run + `draft` session) and no HTTP: the session row is committed
+        first, so the workstream id derived from it is durable before the request
+        that presents it. A rollback after this call now discards an attempt that
+        never happened instead of leaving a live workstream with no row behind it,
+        and a re-run of the handler sends nothing (its own keyed run already
+        exists). See the module's OTI-5786 note in `_attempt_launch()`.
+
+        `env.cr.postcommit` rather than an immediate call: the hook is cleared by
+        `rollback()` and runs by `commit()`, so it is the transaction boundary
+        itself that decides whether the remote effect happens, with no window
+        either side of it. One callback per transaction, delivering every run the
+        transaction armed — a rule fired by a batch, or a webhook that also logs,
+        must not open one cursor per launch.
+
+        The callback never raises into the caller: it runs *after* the commit, so
+        an exception there could not undo anything and would surface as a 500 for
+        a request that succeeded. Failures are recorded on the run instead, and
+        one run's failure does not stop the next.
+
+        A caller whose process dies between the commit and the hook leaves a
+        `queued` run with a committed `draft` session behind it: exactly the shape
+        the queue worker (#5754) drains, and draining it presents the same
+        workstream id this call would have.
+        """
+        self.ensure_one()
+        postcommit = self.env.cr.postcommit
+        # Captured now, deliberately: after the commit the recordset and its
+        # environment are stale, and only these three survive that boundary.
+        registry = self.env.registry
+        context = dict(
+            lang=self.env.lang,
+            allowed_company_ids=[self.company_id.id],
+        )
+        jobs = postcommit.data.setdefault(DELIVERY_JOBS_KEY, [])
+        if any(job_run_id == run.id for job_run_id, _body in jobs):
+            return False
+        jobs.append((run.id, body))
+        if len(jobs) > 1:
+            return True
+
+        @postcommit.add
+        def deliver_armed_launches():
+            # `with registry.cursor()` commits on success and rolls back on a
+            # failure that reached this far, which is the whole of the error
+            # handling the hook itself needs. `jobs` is passed explicitly: this
+            # cursor's own `postcommit` queue belongs to the *caller's*
+            # transaction, and the fresh cursor has an empty one of its own.
+            with registry.cursor() as cr:
+                env = api.Environment(cr, SUPERUSER_ID, context)
+                env["turnstone.automation"]._deliver_armed(jobs)
+
+        return True
+
+    @api.model
+    def _deliver_pending(self):
+        """Deliver, now, the launches *this* transaction armed for post-commit.
+
+        The post-commit hook's body, callable directly for the two callers that
+        cannot wait for a real commit:
+
+        * a test — `TestCursor.commit()` clears `postcommit` instead of running
+          it, so a case that wants to assert on the delivery has to drive it;
+        * a caller in a transaction it does not own (a `--test-enable` run, a
+          shell) that wants the delivery to happen before it commits.
+
+        Popping the queue is what makes a second call a no-op rather than a
+        second delivery. The hook itself does not come through here — it holds
+        the list this transaction armed, which a fresh cursor cannot see. A
+        commit after this call still runs that hook; by then each run is `done`
+        and `_deliver_queued_run()` leaves it alone, so the second pass is a
+        read and nothing more.
+        """
+        jobs = self.env.cr.postcommit.data.pop(DELIVERY_JOBS_KEY, None)
+        if not jobs:
+            return self.env["turnstone.automation.run"].sudo().browse()
+        return self._deliver_armed(jobs)
+
+    @api.model
+    def _deliver_armed(self, jobs):
+        """Deliver each armed `(run_id, body)`. Runs on the post-commit cursor.
+
+        One savepoint per job: a delivery whose own writes fail must not make the
+        transaction unusable for the next one. The savepoint only covers the
+        *local* writes — the remote create is not undone by it, and does not need
+        to be: the workstream was asked for with an id that was committed before
+        the request, so a later attempt adopts it (409) rather than making a
+        second one.
+
+        A failure that got past `_deliver_queued_run`'s own handling is recorded
+        on the run *after* its savepoint rolls back, in a fresh one: the run's
+        own failure write would otherwise be rolled back with the failure it is
+        describing, leaving a `queued` row and no explanation.
+        """
+        delivered = self.env["turnstone.automation.run"].sudo().browse()
+        for run_id, body in list(jobs):
+            try:
+                with self.env.cr.savepoint():
+                    delivered |= self._deliver_queued_run(run_id, body)
+            except Exception as exc:  # noqa: BLE001 - one run must not stop the next
+                _logger.exception(
+                    "Automation launch: run %s could not be delivered after "
+                    "commit; recording it so the run worker can retry.", run_id,
+                )
+                delivered |= self._record_delivery_failure(run_id, exc)
+        return delivered
+
+    @api.model
+    def _record_delivery_failure(self, run_id, exc):
+        """Put an unexpected delivery failure on the run, in its own savepoint."""
+        runs = self.env["turnstone.automation.run"].sudo()
+        run = runs.browse(run_id)
+        if not run.exists() or run.state not in ("queued", "running"):
+            return run
+        try:
+            with self.env.cr.savepoint():
+                rule = run.automation_id.sudo()
+                return run._mark_failed(exc, secrets=rule._launch_secrets())
+        except Exception:  # noqa: BLE001 - the log line above is the fallback
+            _logger.exception(
+                "Automation launch: run %s could not even record why its delivery "
+                "failed; it stays queued for the run worker.", run_id,
+            )
+            return run
+
+    @api.model
+    def _deliver_queued_run(self, run_id, body=None):
+        """The remote half of one launch: create the workstream, write it back.
+
+        Idempotent by construction rather than by bookkeeping. The session this
+        run carries has no `ws_id` yet, and `_ensure_started()` presents
+        `session._client_ws_id()` — derived from a row that was committed before
+        this call — so a delivery repeated for any reason (a retried hook, the
+        run worker #5754, a second process) asks for the same workstream id and
+        is answered 409 and adopted rather than creating a second one.
+
+        ``body`` is the rendered prompt the launch already had. Omitted, it is
+        re-rendered from the run's own trigger record — which is what a run left
+        `queued` by a process that died between the commit and the hook needs,
+        and why the run records `trigger_res_model`/`trigger_res_id` at all. A
+        webhook run has no such record and its payload is not retained, so a
+        re-render for one raises and lands on the run as `failed`: the sender's
+        retry then re-delivers the event, and the `failed` run is retried in
+        place rather than treated as a duplicate.
+
+        A run that is not `queued` or `failed` is left alone: `running` means
+        another launcher holds it, and the terminal states are final. A run whose
+        row has gone (its rule was deleted, and the cascade took it) is skipped.
+        """
+        runs = self.env["turnstone.automation.run"].sudo()
+        run = runs.browse(run_id)
+        if not run.exists() or run.state not in ("queued", "failed"):
+            return run
+        rule = run.automation_id.sudo()
+        session = run.session_id.sudo()
+        if not session.exists():
+            # The intent committed with the run, so this is not a race: the
+            # session was deleted between the commit and here.
+            return run._mark_failed(_(
+                "The session this run was prepared with no longer exists, so its "
+                "prompt could not be delivered. The rule is intact; launch the "
+                "event again to start a new session.",
+            ))
+        if body is None:
+            try:
+                body = rule._queued_run_prompt(run)
+            except UserError as exc:
+                # Nothing was sent, so nothing is counted: `failed` with the
+                # attempt count unchanged says "not tried, and why". Called on
+                # the rule (not `self`, which is an empty recordset here).
+                return rule._fail_run(run, exc)
+        # The same refusal as in `_attempt_launch()`, and reachable here for a
+        # reason that only exists because delivery is a second phase: the
+        # re-render happens NOW, so a record that lost the field's value between
+        # the intent commit and this call renders to nothing (OTI-5789). It sits
+        # AFTER the claim, so only the one launcher that holds this run's
+        # delivery slot can refuse it — a refusal written by a bystander would
+        # contradict a delivery another worker is making right now — and BEFORE
+        # `_mark_running()`, so nothing is counted: nothing was tried.
+        if not self._claim_delivery(run_id):
+            # Another launcher is delivering the same run right now (the run
+            # worker, or a duplicate arm from a second request). It stays queued
+            # for whoever holds it, and nothing is sent twice.
+            _logger.info(
+                "Automation launch: run %s is already being delivered by another "
+                "worker; leaving it alone.", run_id,
+            )
+            return run
+        try:
+            rule._check_rendered_prompt(body)
+        except UserError as exc:
+            return rule._fail_run(run, exc)
+
+        run._mark_running()
+        try:
+            session._ensure_started(first_message=body)
+        except Exception as exc:  # noqa: BLE001 - see the class docstring on errors
+            # Recorded rather than raised: a transport failure is the honest
+            # `failed` on the run, and a `failed` run is retried in place by
+            # whoever re-delivers the event. The log line gets the same cleaning
+            # as the row — see `_launch_secrets()`.
+            secrets = rule._launch_secrets()
+            cleaned = run._clean_text(exc, secrets)
+            _logger.warning(
+                "Automation %s: run %s failed to launch: %s",
+                rule.name, run.id, cleaned,
             )
             return run._mark_failed(exc, secrets=secrets)
 
         run._mark_done(session)
         self.env["turnstone.audit.log"].log(
-            "session_create", session=session, agent=self.sudo().agent_id, user=owner,
+            "session_create", session=session, agent=rule.agent_id,
+            user=session.user_id,
             detail=_("Started by the automation %(rule)s, run %(run)s.") % {
-                "rule": self.name, "run": run.id,
+                "rule": rule.name, "run": run.id,
             },
         )
         return run
+
+    @api.model
+    def _claim_delivery(self, run_id):
+        """Take this run's delivery slot for the current transaction, or `False`.
+
+        `pg_try_advisory_xact_lock`, not `SELECT … FOR UPDATE`: at Odoo's
+        REPEATABLE READ a blocking row lock turns the loser into a
+        `SerializationFailure` *after* it may already have POSTed, which is the
+        failure this ticket is about. A try-lock lets the loser step back without
+        writing anything, and being transaction-scoped it is released by the
+        commit that ends this delivery — it cannot be leaked by a crash.
+        """
+        self.env.cr.execute(
+            "SELECT pg_try_advisory_xact_lock(%s, %s)",
+            (LAUNCH_DELIVERY_LOCK_NAMESPACE, run_id),
+        )
+        return bool(self.env.cr.fetchone()[0])
 
     def _fail_run(self, run, error):
         """Record a refusal on `run`, including on a retry refused the same way.
@@ -1241,6 +1576,113 @@ class TurnstoneAutomation(models.Model):
         agent._check_user_allowed(owner)
         return True
 
+    def _check_rendered_prompt(self, body):
+        """Raise when `body` carries no instruction for the agent.
+
+        `_check_prompt_template()` refuses a blank *template*, and that is not
+        the same promise as a *render*: `{{ email }}` is a perfectly good
+        template, and a record whose email is empty renders it to `""` —
+        `_render_value()` answers `""` for a falsy value. Sending that creates a
+        workstream with **no prompt at all**, because
+        `TurnstoneClient.create_session()` gates `initial_message` on
+        truthiness, so the field is absent from the request; the session then
+        starts `idle` (`"thinking" if first_message else "idle"`) and the run is
+        marked `done`, whose documented meaning is "a session exists AND the
+        prompt was delivered to it". The event reached an agent with no
+        instruction, silently, and the run history says everything worked
+        (OTI-5789).
+
+        So an empty or whitespace-only body is refused as `failed` with
+        `attempt_count == 0`: the same shape as a template that will not render,
+        because nothing was tried either. Only *nothing* refuses. A render that
+        merely lost a placeholder still carries the text around it, and
+        `_render_value()`'s `MAX_VALUE_CHARS` cap with its `… [truncated]` marker
+        is content, not emptiness.
+
+        The message names the rule and the situation, never the record's values:
+        it is stored on a run row, and the reason the render was empty is a
+        blank field, which is the business data this must not copy.
+
+        A non-string body is judged by truthiness, the same gate
+        `create_session()` applies to it, so the two cannot disagree about what
+        "no prompt" means.
+        """
+        self.ensure_one()
+        if isinstance(body, str):
+            empty = not body.strip()
+        else:
+            empty = not body
+        if not empty:
+            return True
+        raise UserError(_(
+            "%(rule)s's prompt rendered to nothing for this event, so the agent "
+            "would have been started with no instruction. A prompt made only of "
+            "placeholders — {{ field }} with a blank field — renders empty when "
+            "the record has nothing in it; write some text of your own beside "
+            "the placeholders, or fill the field in.",
+        ) % {"rule": self.name})
+
+    def _check_record_company(self, record):
+        """Raise unless `record`'s company is this rule's, when it has one.
+
+        Defence in depth for the company wall (OTI-5788). The trigger adapters
+        filter a record through `turnstone.trigger.record._company_ok()` before
+        they queue a run, but this service is also called directly — by a
+        server action, a workflow, or an adapter written later — and a
+        company-B record handed to a company-A rule renders company-B field
+        values into the prompt of a session attributed inside company A. The
+        run row inherits the rule's company, so nothing downstream would flag
+        it. The caller's obligation is stated in `_launch_for_record()`; this
+        is the service enforcing it instead of trusting it.
+
+        Three cases, and the two permissive ones are deliberate:
+
+        * the model has no `company_id` at all — nothing to compare, so the
+          launch proceeds. `company_id` is Odoo's convention; a model that
+          names its company field something else (or gives the name to a link
+          that is not `res.company`) is treated as carrying none, and an
+          adapter watching such a model applies its own wall.
+        * the record's company is empty — a *shared* record, which in Odoo
+          means every company uses the row (`res.partner.company_id` empty is
+          the standard example). It may supply any company's rule.
+        * the record's company is set — it has to be this rule's company.
+
+        Narrower on purpose than `_company_ok()`: that one also asks whether
+        this environment may see the rule's company, which is a question about
+        the *caller* and belongs to the adapters. The launch service only has
+        to answer "is this record's company the rule's", and asking more here
+        would refuse launches the drain can legitimately make.
+
+        Read with `sudo()`: whether the launching user may read the record is a
+        separate question from whether it may supply this rule's prompt, and a
+        refusal has to be recordable either way. The message names the model
+        and the record's id but never its display name — it is stored on a run
+        row that the rule's company can read, and the point of the check is
+        that the other company's business data does not cross that wall.
+        """
+        self.ensure_one()
+        if record is None or not record:
+            return True
+        field = record._fields.get("company_id")
+        if field is None or field.type != "many2one" \
+                or field.comodel_name != "res.company":
+            return True
+        company = record.sudo().company_id
+        if not company or company.id == self.company_id.id:
+            return True
+        raise UserError(_(
+            "%(rule)s belongs to %(company)s, and the %(model)s record #%(id)s it "
+            "was given belongs to %(record_company)s. A launch can only put a "
+            "record of the rule's own company into its prompt; a record with no "
+            "company at all is shared and is allowed.",
+        ) % {
+            "rule": self.name,
+            "company": self.company_id.display_name,
+            "model": record._name,
+            "id": record.id,
+            "record_company": company.display_name,
+        })
+
     def _create_launch_session(self, owner, record=None):
         """The session row a launch sends its prompt from.
 
@@ -1283,6 +1725,45 @@ class TurnstoneAutomation(models.Model):
         self.ensure_one()
         connection = self.sudo().agent_id.connection_id
         return [token for token in (connection.sudo().api_token,) if token] if connection else []
+
+    def _queued_run_prompt(self, run):
+        """Re-render a queued run's prompt from its own trigger record.
+
+        The delivery that follows a launch holds the rendered body already, so
+        this is for the run nobody carried past the commit: the process died
+        between `commit()` and the post-commit hook, and the run worker picks the
+        `queued` row up later (#5754). Re-rendering is honest there because the
+        record is still the one the run was opened for — `trigger_res_model` and
+        `trigger_res_id` are frozen at create for exactly this — and the template
+        is trusted configuration.
+
+        Two cases where re-rendering is not possible, and both raise rather than
+        send something half-right:
+
+        * A **webhook** run has no trigger record, and its payload is deliberately
+          not retained. Its prompt cannot be reconstructed, so the run is failed
+          and the sender's retry re-delivers the event (a `failed` run is retried
+          in place, never mistaken for a duplicate).
+        * A rule whose prompt needs fields, for a run with no surviving record.
+          `_render_prompt()` says which field it could not read.
+        """
+        run.ensure_one()
+        record = None
+        if run.trigger_res_model and run.trigger_res_id:
+            if run.trigger_res_model in self.env:
+                record = self.env[run.trigger_res_model].sudo().browse(
+                    run.trigger_res_id,
+                )
+                if not record.exists():
+                    record = None
+        if record is None:
+            raise UserError(_(
+                "Run %(run)s of %(rule)s is still queued and its prompt was not "
+                "retained, so it cannot be sent now. It was queued by a trigger "
+                "that carries no record (a webhook delivery or a manual call); "
+                "deliver the event again to launch it.",
+            ) % {"run": run.display_name, "rule": self.name})
+        return self._render_prompt(record)
 
     # -- inbound webhooks (#5755) ------------------------------------------
 

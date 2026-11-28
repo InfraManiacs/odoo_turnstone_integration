@@ -43,6 +43,9 @@ from odoo.exceptions import UserError
 from odoo.tests import TransactionCase, tagged
 
 from odoo.addons.turnstone_integration.models.redaction import REDACTED
+from odoo.addons.turnstone_integration.models.turnstone_automation import (
+    MAX_VALUE_CHARS,
+)
 from odoo.addons.turnstone_integration.models.turnstone_automation_run import (
     MAX_ERROR_CHARS,
 )
@@ -444,6 +447,382 @@ class TestPermissionRefusal(AutomationLaunchCase):
         self.assertEqual(delivered.id, refused.id)
         self.assertEqual(delivered.state, "done", delivered.error)
         self.assertEqual(len(_mock_workstreams()), 1)
+
+
+@tagged("post_install", "-at_install")
+class TestRecordCompanyWall(AutomationLaunchCase):
+    """A trigger record of another company launches nothing, and says so.
+
+    The adapters filter a record through `turnstone.trigger.record._company_ok()`
+    before queueing a run, so nothing in-tree reaches this today. That is exactly
+    why it is tested at the service: the adapters are the first line of defence,
+    and a service that trusts its caller is one caller away from putting company
+    B's field values into company A's prompt. `_launch_for_record()` is the
+    documented entry point for any module, so the wall belongs here too.
+
+    The two permissive cases are pinned as hard as the refusal: an over-eager
+    check would break every rule watching a model with no `company_id` (a
+    country, a currency, a partner tag) and every rule on a shared record.
+    """
+
+    def _other_company(self, name="Other Co (record wall)"):
+        return self.env["res.company"].create({"name": name})
+
+    def test_a_record_of_another_company_is_refused_before_any_call(self):
+        other = self._other_company()
+        # A company-B partner, named so the assertion can prove the name did not
+        # travel: the run row is company A's, and its error is read by company
+        # A's managers.
+        partner = self.env["res.partner"].create({
+            "name": "Company B Secret Co",
+            "email": "secret@b.example",
+            "company_id": other.id,
+        })
+        rule = self._rule_for_record(suffix="company-wall")
+
+        run = rule._launch_for_record(partner, idempotency_key="evt-company-wall")
+
+        self.assertEqual(run.state, "failed")
+        self.assertEqual(run.attempt_count, 0, "nothing was tried")
+        self.assertIn(other.display_name, run.error,
+                      "the refusal must name the record's company")
+        self.assertIn(self.company.display_name, run.error,
+                      "and the rule's, so the mismatch is legible")
+        self.assertNotIn("Company B Secret Co", run.error,
+                         "the other company's business data must not cross the "
+                         "wall in the explanation either")
+        self.assertFalse(run.session_id, "a refused launch creates no session")
+        self.assertEqual(_creates(), [], "the wall must be hit before any HTTP")
+        self.assertEqual(_mock_workstreams(), [], "nothing on the server")
+
+    def test_a_record_of_the_rules_own_company_still_launches(self):
+        """The control: the check refuses a mismatch, not a stamped record."""
+        partner = self.env["res.partner"].create({
+            "name": "Company A Co",
+            "company_id": self.company.id,
+        })
+        rule = self._rule_for_record(suffix="company-same")
+
+        run = rule._launch_for_record(partner, idempotency_key="evt-company-same")
+
+        self.assertEqual(run.state, "done", run.error)
+        self.assertEqual(len(_creates()), 1)
+
+    def test_a_model_with_no_company_field_is_unaffected(self):
+        """A model that carries no `company_id` has no company to compare."""
+        rule = self._rule_for_record(
+            suffix="no-company-field",
+            target_model_id=self.env["ir.model"]._get("res.country").id,
+            prompt_template="Write a note about {{ name }} ({{ code }}).",
+        )
+        country = self.env["res.country"].create({
+            "name": "Turnstonia", "code": "TS",
+        })
+        self.assertNotIn("company_id", country._fields,
+                         "the fixture is only meaningful on a model with no company")
+
+        run = rule._launch_for_record(country, idempotency_key="evt-no-company")
+
+        self.assertEqual(run.state, "done", run.error)
+        self.assertEqual(
+            _mock_workstreams()[0]["messages"][0]["content"],
+            "Write a note about Turnstonia (TS).",
+        )
+
+    def test_a_shared_record_is_allowed(self):
+        """An empty company on the record means shared, which Odoo allows."""
+        partner = self.env["res.partner"].create({"name": "Shared Contact"})
+        self.assertFalse(partner.company_id, "the fixture's partner is shared")
+        rule = self._rule_for_record(suffix="company-shared")
+
+        run = rule._launch_for_record(partner, idempotency_key="evt-company-shared")
+
+        self.assertEqual(run.state, "done", run.error)
+        self.assertEqual(len(_creates()), 1)
+
+    def test_the_drain_is_covered_too(self):
+        """The check lives in the one attempt path, not only the caller's.
+
+        `_attempt_launch()` is what #5754's drain calls, so a check written into
+        `_launch_for_record()` alone would leave the cron on the old path. This
+        drives the attempt directly, with no launch service in front of it.
+        """
+        other = self._other_company("Other Co (drain wall)")
+        partner = self.env["res.partner"].create({
+            "name": "Drained B Co", "company_id": other.id,
+        })
+        rule = self._rule_for_record(suffix="company-drain")
+        run = self.env["turnstone.automation.run"].sudo()._open_for_event(
+            rule, "evt-drain-company", record=partner,
+        )[0]
+
+        rule._attempt_launch(run, partner, None, "Greet Drained B Co.")
+
+        self.assertEqual(run.state, "failed")
+        self.assertEqual(run.attempt_count, 0)
+        self.assertIn(other.display_name, run.error)
+        self.assertEqual(_creates(), [])
+
+
+@tagged("post_install", "-at_install")
+class TestEmptyRenderRefusal(AutomationLaunchCase):
+    """A prompt that renders to nothing refuses the launch (OTI-5789).
+
+    `_check_prompt_template()` validates the *template*, which is a different
+    promise from a *render*: `{{ email }}` is a good template, and a partner
+    with no email renders it to `""` (`_render_value()` answers `""` for a falsy
+    value). `TurnstoneClient.create_session()` gates `initial_message` on
+    truthiness, so the field is absent from the request, the workstream is
+    created with **no prompt in it**, and the run is marked `done` — whose
+    documented meaning is "a session exists **and** the prompt was delivered to
+    it". The event reached an agent with no instruction and the run history says
+    everything worked.
+
+    The launch is two-phase (OTI-5786), so a case has to drive the delivery to
+    say anything about HTTP: phase one arms a post-commit job and sends nothing,
+    and a refusal arms nothing. `_launch_and_deliver()` below does both, which is
+    what makes "no create on the mock" an observation rather than a tautology.
+
+    The boundary is pinned in both directions: only *nothing* refuses. A render
+    that lost a placeholder but kept its own text still launches, and a value
+    that hit the `MAX_VALUE_CHARS` cap is content, not emptiness.
+    """
+
+    def _forget_armed_jobs(self):
+        """Drop launches this transaction armed but will never deliver.
+
+        `TestCursor.commit()` **clears** `postcommit` instead of running it, and
+        a savepoint rollback does not, so a job armed by one case would
+        otherwise still be sitting there — and `_deliver_pending()` in the next
+        case would deliver it against that case's freshly reset mock.
+        `postcommit.clear()` drops the callbacks and their data together, which
+        is exactly the state a process that died between the commit and the hook
+        leaves behind.
+        """
+        self.env.cr.postcommit.clear()
+
+    def _launch_and_deliver(self, rule, *args, **kwargs):
+        """Launch, then drive the phase-two delivery this test transaction owes.
+
+        Phase one arms a post-commit job and sends nothing (OTI-5786), so a case
+        that says anything about HTTP has to run phase two.
+        `_deliver_pending()` is the documented way to do that where a real
+        commit cannot happen.
+        """
+        self._forget_armed_jobs()
+        run = rule._launch_for_record(*args, **kwargs)
+        self.env["turnstone.automation"]._deliver_pending()
+        run.invalidate_recordset()
+        return run
+
+    def _blank_email_rule(self, suffix, **vals):
+        """A rule whose whole prompt is one placeholder on a blank field."""
+        return self._rule_for_record(
+            suffix=suffix, prompt_template="{{ email }}", **vals,
+        )
+
+    def test_a_prompt_that_renders_to_nothing_is_refused_before_any_call(self):
+        partner = self.env["res.partner"].create({"name": "No Email Co"})
+        self.assertFalse(partner.email, "the fixture's field is blank")
+        rule = self._blank_email_rule("empty-render")
+
+        run = self._launch_and_deliver(
+            rule, partner, idempotency_key="evt-empty",
+        )
+
+        self.assertEqual(run.state, "failed")
+        self.assertEqual(run.attempt_count, 0, "nothing was tried")
+        self.assertIn("rendered to nothing", run.error,
+                      "the run has to name the situation, not just say failed")
+        self.assertIn("no instruction", run.error,
+                      "and what would have happened without the refusal")
+        self.assertFalse(run.session_id,
+                         "a refused launch creates no session row at all")
+        self.assertEqual(
+            self.env["turnstone.session"].sudo().search_count(
+                [("user_id", "=", self.env.user.id)]), 0,
+            "not even an unlinked one: `_launch_session()` must not have run",
+        )
+        self.assertEqual(_creates(), [], "nothing may reach the server")
+        self.assertEqual(_mock_workstreams(), [], "no unprompted workstream")
+
+    def test_a_whitespace_only_render_is_refused_too(self):
+        """Whitespace is what `create_session()` would also drop, so it counts."""
+        partner = self.env["res.partner"].create({"name": "Blank Co"})
+        rule = self._rule_for_record(
+            suffix="whitespace-render", prompt_template="  {{ email }}  ",
+        )
+
+        run = self._launch_and_deliver(
+            rule, partner, idempotency_key="evt-blank",
+        )
+
+        self.assertEqual(run.state, "failed")
+        self.assertEqual(run.attempt_count, 0)
+        self.assertIn("rendered to nothing", run.error)
+        self.assertEqual(_creates(), [])
+
+    def test_an_empty_prompt_override_behaves_the_same(self):
+        """An explicit `prompt=""` is the same defect by a different door."""
+        rule = self._rule_for_record(suffix="empty-override")
+
+        run = self._launch_and_deliver(
+            rule, idempotency_key="evt-empty-override", prompt="",
+        )
+
+        self.assertEqual(run.state, "failed")
+        self.assertEqual(run.attempt_count, 0)
+        self.assertIn("rendered to nothing", run.error)
+        self.assertFalse(run.session_id)
+        self.assertEqual(_creates(), [])
+        self.assertEqual(_mock_workstreams(), [])
+
+    def test_a_whitespace_prompt_override_behaves_the_same(self):
+        rule = self._rule_for_record(suffix="blank-override")
+
+        run = self._launch_and_deliver(
+            rule, idempotency_key="evt-blank-override", prompt="   \n\t ",
+        )
+
+        self.assertEqual(run.state, "failed")
+        self.assertEqual(run.attempt_count, 0)
+        self.assertIn("rendered to nothing", run.error)
+        self.assertEqual(_creates(), [])
+
+    def test_a_non_empty_override_is_unaffected(self):
+        """The control: the check refuses emptiness, not overrides."""
+        rule = self._rule_for_record(suffix="good-override")
+
+        run = self._launch_and_deliver(
+            rule, idempotency_key="evt-good-override", prompt="Do the thing.",
+        )
+
+        self.assertEqual(run.state, "done", run.error)
+        self.assertEqual(
+            [m["content"] for m in _mock_workstreams()[0]["messages"]
+             if m["role"] == "user"],
+            ["Do the thing."],
+            "a non-empty override is sent verbatim",
+        )
+        self.assertEqual(len(_creates()), 1)
+
+    def test_a_render_that_kept_its_own_text_still_launches(self):
+        """Losing one placeholder is not emptiness: the instruction survives."""
+        partner = self.env["res.partner"].create({"name": "Half Co"})
+        rule = self._rule_for_record(
+            suffix="half-render", prompt_template="Write to {{ email }} today.",
+        )
+
+        run = self._launch_and_deliver(
+            rule, partner, idempotency_key="evt-half",
+        )
+
+        self.assertEqual(run.state, "done", run.error)
+        self.assertEqual(
+            [m["content"] for m in _mock_workstreams()[0]["messages"]
+             if m["role"] == "user"],
+            ["Write to  today."],
+            "the empty placeholder renders as nothing, as it always has",
+        )
+
+    def test_a_truncated_value_is_content_not_emptiness(self):
+        """The cap and its marker are unchanged; a capped render still sends."""
+        partner = self.env["res.partner"].create({
+            "name": "x" * (MAX_VALUE_CHARS + 50),
+        })
+        rule = self._rule_for_record(
+            suffix="truncated-render", prompt_template="{{ name }}",
+        )
+
+        run = self._launch_and_deliver(
+            rule, partner, idempotency_key="evt-truncated",
+        )
+
+        self.assertEqual(run.state, "done", run.error)
+        sent = [m["content"] for m in _mock_workstreams()[0]["messages"]
+                if m["role"] == "user"][0]
+        self.assertIn("… [truncated]", sent,
+                      "the truncation marker must still be there")
+        self.assertEqual(sent[:MAX_VALUE_CHARS], "x" * MAX_VALUE_CHARS,
+                         "the cap is unchanged: exactly MAX_VALUE_CHARS of value")
+
+    def test_an_x2many_render_is_unchanged(self):
+        """A list of names is a render like any other: still one prompt.
+
+        Asserted on membership rather than on order: this case is about the
+        emptiness check not touching x2many rendering, and a relation's default
+        order is not this module's promise.
+        """
+        partner = self.env["res.partner"].create({"name": "Tagged Co"})
+        partner.category_id = [
+            (6, 0, [
+                self.env["res.partner.category"].create({"name": "Wholesale"}).id,
+                self.env["res.partner.category"].create({"name": "VIP"}).id,
+            ]),
+        ]
+        rule = self._rule_for_record(
+            suffix="x2many-render", prompt_template="Tags: {{ category_id }}",
+        )
+
+        run = self._launch_and_deliver(
+            rule, partner, idempotency_key="evt-x2many",
+        )
+
+        self.assertEqual(run.state, "done", run.error)
+        sent = [m["content"] for m in _mock_workstreams()[0]["messages"]
+                if m["role"] == "user"][0]
+        self.assertTrue(sent.startswith("Tags: "), sent)
+        self.assertIn("Wholesale", sent)
+        self.assertIn("VIP", sent)
+        self.assertIn(", ", sent, "an x2many renders as a comma-separated list")
+
+    def test_the_drain_is_covered_too(self):
+        """`_attempt_launch()` is the one attempt path, so the cron gets it.
+
+        A check written into `_launch_for_record()` alone would leave #5754's
+        drain sending an empty prompt from a `queued` run.
+        """
+        partner = self.env["res.partner"].create({"name": "Drained Co"})
+        rule = self._blank_email_rule("empty-drain")
+        run = self.env["turnstone.automation.run"].sudo()._open_for_event(
+            rule, "evt-empty-drain", record=partner,
+        )[0]
+
+        rule._attempt_launch(run, partner, None, None)
+
+        self.assertEqual(run.state, "failed")
+        self.assertEqual(run.attempt_count, 0)
+        self.assertIn("rendered to nothing", run.error)
+        self.assertFalse(run.session_id)
+        self.assertEqual(_creates(), [])
+
+    def test_the_re_render_at_delivery_is_covered_too(self):
+        """Delivery re-renders from the record, so it can go empty in between.
+
+        Phase one renders and arms the delivery; phase two (a cron, a retried
+        hook) re-renders from `trigger_res_model`/`trigger_res_id`. The field can
+        be blank by then, and a body that arrived as `None` must not become an
+        unprompted create on the way out.
+        """
+        partner = self.env["res.partner"].create({
+            "name": "Late Co", "email": "late@example.com",
+        })
+        rule = self._blank_email_rule("empty-delivery")
+        run = rule._launch_for_record(partner, idempotency_key="evt-late")
+        self.assertEqual(run.state, "queued", run.error)
+        self.assertEqual(_creates(), [], "phase one makes no HTTP at all")
+
+        # The process died between the commit and the hook: the armed job is
+        # gone, the record lost the value, and the drain arrives with no body.
+        self._forget_armed_jobs()
+        partner.email = False
+        delivered = self.env["turnstone.automation"]._deliver_queued_run(run.id)
+
+        self.assertEqual(delivered.state, "failed")
+        self.assertEqual(delivered.attempt_count, 0, "nothing was tried")
+        self.assertIn("rendered to nothing", delivered.error)
+        self.assertEqual(_creates(), [], "still no create: the body was empty")
+        self.assertEqual(_mock_workstreams(), [])
 
 
 @tagged("post_install", "-at_install")
