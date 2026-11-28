@@ -4,6 +4,7 @@ from . import turnstone_catalog
 from . import turnstone_agent
 from . import turnstone_automation
 from . import turnstone_automation_run
+from . import turnstone_trigger_record
 from . import turnstone_audit_log
 from . import turnstone_session
 from . import turnstone_message
