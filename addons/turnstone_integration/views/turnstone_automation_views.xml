@@ -128,6 +128,30 @@
                                     authenticates a delivery; the key alone reaches nothing.
                                 </div>
                             </div>
+                            <field name="schedule_date_field"
+                                   invisible="trigger_type != 'schedule'"
+                                   placeholder="date_deadline"/>
+                            <div colspan="2" class="text-muted small"
+                                 invisible="trigger_type != 'schedule'">
+                                The date or datetime field that decides when a record is due.
+                                A record fires when it passes the filter above <em>and</em> this
+                                field is at or before now.
+                            </div>
+                            <field name="schedule_interval_minutes"
+                                   invisible="trigger_type != 'schedule'"/>
+                            <div colspan="2" class="text-muted small"
+                                 invisible="trigger_type != 'schedule'">
+                                How often this rule may fire for the <em>same</em> record. The
+                                scanner may run every few minutes; a record fires at most once
+                                per window. 0 fires each record once and never again.
+                            </div>
+                            <field name="schedule_limit"
+                                   invisible="trigger_type != 'schedule'"/>
+                            <div colspan="2" class="text-muted small"
+                                 invisible="trigger_type != 'schedule'">
+                                The most records one scan fires for. Records over the ceiling
+                                stay due and are taken by the next scan.
+                            </div>
                         </group>
                     </group>
                     <group string="What it asks">

@@ -49,12 +49,15 @@ honestly claim the agent finished — and a run whose session later fails stays
 event not reach an agent", which is the question a person actually asks.
 """
 
+import logging
 import uuid
 
 from odoo import _, api, fields, models
 from odoo.exceptions import UserError
 
 from .redaction import redact
+
+_logger = logging.getLogger(__name__)
 
 # The state graph. `done` and `skipped` are terminal by having no successors: a
 # later event is a new run with its own key, never a reopened row — a history
@@ -87,6 +90,40 @@ IMMUTABLE_FIELDS = (
 # is capped so a 40-line HTML error page cannot become the record, and cut with
 # a visible marker so nobody mistakes a truncated message for the whole one.
 MAX_ERROR_CHARS = 2000
+
+# The `pg_try_advisory_xact_lock` namespace the drain claims runs under. Its own
+# value ("TSDR", well inside int4) rather than a shared one: a drain lock and a
+# session-sync lock must never be mistaken for each other, and advisory locks
+# are keyed on (namespace, id) so two namespaces cannot collide.
+DRAIN_LOCK_NAMESPACE = 0x54534452
+
+# How many `queued` runs one cron tick will attempt. A queue can be long after
+# an outage, and one tick must not run for hours: the rest are picked up by the
+# next tick, which is a minute away. The drain is safe to under-serve and unsafe
+# to over-serve, so this is a ceiling on a batch rather than a target.
+DRAIN_BATCH_SIZE = 50
+
+# How many times a run may be attempted by the drain before it is left `failed`.
+# A launch that fails for a transient reason is worth retrying; one that fails
+# for a *configuration* reason (no run-as user, a prompt that will not render)
+# is not, and retrying it forever would turn a visible `failed` run into a log
+# nobody reads. The drain only picks `queued` runs, so a failure is a real
+# attempt, not a refusal before trying.
+MAX_DRAIN_ATTEMPTS = 3
+
+#: `ir.config_parameter` key for how often the drain cron runs, in minutes. One
+#: value for the whole deployment: how fast this instance turns queued runs into
+#: sessions is a property of its queue, not of any one rule.
+DRAIN_INTERVAL_PARAM = "turnstone_integration.drain_interval_minutes"
+
+#: The interval used when the parameter is unset or unusable. One minute is the
+#: shortest interval Odoo's cron scheduler supports, and a queued run is an
+#: event a person is waiting on, so the default is "as soon as it can".
+DRAIN_INTERVAL_MINUTES = 1
+
+#: The cron row's xmlid, so `_sync_drain_interval()` can find the row it is
+#: supposed to configure without a search that could match a hand-made cron.
+DRAIN_CRON_XMLID = "turnstone_integration.ir_cron_turnstone_drain_runs"
 
 # What a credential looks like when a client library prints a request lives in
 # `models/redaction.py`, shared with `TurnstoneClient` — the client's own warning
@@ -525,6 +562,252 @@ class TurnstoneAutomationRun(models.Model):
             ("state", "in", list(WINDOW_STATES)),
         ], order="id desc", limit=1)
         return self.browse(found.ids)
+
+    # -- the drain: turning `queued` runs into `done`/`failed` (#5754) -------
+
+    @api.model
+    def _drain_queue(self, limit=None):
+        """Attempt every `queued` run this worker can claim, and return them.
+
+        This is the cron's entry point. Adapters (#5752–#5756) only ever write a
+        `queued` row; nothing in the system starts the session for one until
+        this runs. It is deliberately not called from any ORM hook: a launch is
+        an HTTP call (up to 120 s), and an ORM hook runs inside somebody's form
+        save.
+
+        **Claiming is per run, not per batch.** The runs are read first, then
+        each is claimed individually by `_claim_for_drain()`, so a worker that
+        dies mid-batch leaves the runs it had not reached still `queued` for the
+        next worker rather than `running` forever. It also means two workers
+        running the same cron cannot split a batch down the middle: each run has
+        exactly one owner.
+
+        Nothing is committed here. The cron worker commits the transaction when
+        the job returns, and a test that drives this directly stays inside its
+        own transaction.
+        """
+        limit = DRAIN_BATCH_SIZE if limit is None else max(0, limit)
+        if not limit:
+            return self.browse()
+        candidates = self.sudo().search(
+            [("state", "=", "queued")], order="queued_at, id", limit=limit,
+        )
+        attempted = self.browse()
+        for candidate in candidates:
+            run = self._claim_for_drain(candidate)
+            if not run:
+                # Another worker took it, or it moved between the search and
+                # the claim. Not an error: the run is somebody else's problem
+                # now, and doing nothing is what "somebody else has it" means.
+                continue
+            attempted |= self._launch_claimed_run(run)
+        return attempted
+
+    @api.model
+    def _claim_for_drain(self, run):
+        """The run if this transaction now owns draining it, or an empty set.
+
+        Two walls, in this order, and both are needed:
+
+        1. `pg_try_advisory_xact_lock` on the run's id — *try*, not block. At
+           Odoo's REPEATABLE READ a blocking lock does not serialise two
+           workers: the waiter's snapshot is pinned at its first statement, so
+           once the holder commits the waiter's own UPDATE still raises
+           `SerializationFailure`. A try-lock turns "two workers conflict a
+           little later" into "one worker, one no-op", and it is
+           transaction-scoped so it cannot leak if a caller forgets to give it
+           back. Same reasoning as `turnstone.session._session_write_lock()`.
+
+        2. A state re-read **from the database**. The lock says the row is ours;
+           it says nothing about what state the row is in, and this
+           transaction's cache may still hold the `queued` it was searched with.
+           Only the database's answer decides whether an attempt is still
+           allowed — otherwise a run that a concurrent worker had already
+           finished would be launched a second time by the loser of the lock.
+
+        Returns an empty recordset when either wall refuses. That is not an
+        error and not a duplicate run: it is the answer "somebody else got here
+        first", the same contract as `_open_for_event()`'s ``created=False``.
+        """
+        if not run:
+            return self.browse()
+        self.env.cr.execute(
+            "SELECT pg_try_advisory_xact_lock(%s, %s)",
+            (DRAIN_LOCK_NAMESPACE, run.id),
+        )
+        if not self.env.cr.fetchone()[0]:
+            _logger.info(
+                "Automation run %s is already being drained by another worker; "
+                "leaving it to them.", run.id,
+            )
+            return self.browse()
+        claimed = self.sudo().browse(run.id)
+        claimed.invalidate_recordset()
+        if claimed.state != "queued":
+            _logger.info(
+                "Automation run %s is %s, not queued, so this worker does not "
+                "launch it.", run.id, claimed.state,
+            )
+            return self.browse()
+        return claimed
+
+    def _launch_claimed_run(self, run):
+        """Hand one claimed run to the launch service, and return the run.
+
+        **This is the seam the whole drain exists for, and it is deliberately a
+        call to `_attempt_launch()` rather than a second implementation of the
+        POST.** `_launch_for_record()` cannot be used here: it opens the run
+        itself (`_open_for_event`) and answers an existing `queued` run with
+        "already handled, not launching again" — which is right for a caller
+        that has just seen an *event*, and wrong for the worker whose whole job
+        is that already-existing `queued` run. `_attempt_launch()` is the same
+        one-attempt code path `_launch_for_record()` uses after it has claimed
+        an event: permissions, render, `_mark_running()`, the session create and
+        `_mark_done()`, and the failure paths that land on `failed`. So there is
+        one implementation of "what a launch does", not two that can drift.
+
+        ``triggering_user=None`` is the honest answer for a cron: there is no
+        user, and the rule's `run_as` decides. A rule set to "Whoever triggered
+        it" therefore lands `failed` with `attempt_count == 0` and the rule
+        model's own explanation, which is exactly what a person investigating
+        "why did this never fire" needs to read. It never falls back to the
+        superuser: an unattended run that used root's rights would pass every
+        check and leave nobody answerable for it.
+
+        Each run is attempted in its own savepoint. A launch is one event's
+        worth of work, and a database error in it (a constraint, a bad write)
+        must not poison the transaction the other runs in this batch still need.
+        """
+        run.ensure_one()
+        rule = run.automation_id
+        if not rule:
+            # The rule was deleted between the search and the claim; its runs go
+            # with it via `ondelete="cascade"`, but a stale id can survive in
+            # this transaction's cache.
+            return run
+        if (run.attempt_count or 0) >= MAX_DRAIN_ATTEMPTS:
+            # A run that has already been tried this many times is not going to
+            # succeed by being tried again; leaving it `failed` with its reason
+            # is the answer, and re-attempting it forever would bury it.
+            return run
+        record = self._run_record_for_drain(run)
+        try:
+            with self.env.cr.savepoint():
+                rule._attempt_launch(run, record, None, self._drain_prompt(run))
+        except Exception as exc:  # noqa: BLE001 - one run may not stop the batch
+            # `_attempt_launch` already records its own failures, so reaching
+            # here means something outside its guards broke. It still may not
+            # take the rest of the batch with it, and the run must not be left
+            # claiming `running` with no explanation.
+            secrets = rule._launch_secrets()
+            _logger.exception(
+                "Automation %s: draining run %s raised unexpectedly: %s",
+                rule.name, run.id, run._clean_text(exc, secrets),
+            )
+            if run.state in ("queued", "running"):
+                run._mark_failed(exc, secrets=secrets)
+        return run
+
+    @api.model
+    def _run_record_for_drain(self, run):
+        """The business record a run is about, rebuilt from its plain-text id.
+
+        The trigger model and id are kept as text plus an integer on purpose
+        (the model may be uninstalled later), so they are resolved back through
+        the registry rather than a foreign key. A model that no longer exists, or
+        a record that has since been deleted, answers "nothing" rather than
+        raising: a rule whose record is gone still has to be able to record that
+        its run could not be launched.
+        """
+        if not run.trigger_res_model or not run.trigger_res_id:
+            return None
+        if run.trigger_res_model not in self.env:
+            return None
+        model = self.env[run.trigger_res_model]
+        return model.sudo().browse(run.trigger_res_id).exists() or None
+
+    @api.model
+    def _drain_prompt(self, run):
+        """The prompt a drained run should send, or `None` to render the rule's.
+
+        A chatter run's template is only the *instruction*: the customer's words
+        are the event and are not a field of the record, so
+        `rule._render_prompt(record)` alone would reach the agent with nothing to
+        act on. #5753's adapter publishes `prompt_for_run(run)` for exactly this
+        seam. It is looked up **by model name, not imported**, because that file
+        may not be installed: the drain must work on a database without the
+        chatter adapter, and an adapter that is absent means "no rule of that
+        kind exists" rather than an ImportError in the cron.
+
+        Everything else — a record rule, a schedule rule, a webhook — renders
+        from its own template, so this answers `None` and `_attempt_launch` does
+        what it always does.
+        """
+        rule = run.automation_id
+        if rule.trigger_type != "chatter_message":
+            return None
+        if "turnstone.trigger.chatter" not in self.env:
+            return None
+        try:
+            return self.env["turnstone.trigger.chatter"].sudo().prompt_for_run(run)
+        except Exception:  # noqa: BLE001 - a prompt that will not compose is not fatal
+            # Falling back to the rule's own template is better than refusing: the
+            # instruction alone is still something an agent can act on, and
+            # `_attempt_launch` records a real render failure on the run.
+            _logger.warning(
+                "Automation %s: could not compose the chatter prompt for run %s; "
+                "falling back to the rule's template.", rule.name, run.id,
+                exc_info=True,
+            )
+            return None
+
+    @api.model
+    def _drain_interval_minutes(self):
+        """How often the drain cron runs, from `ir.config_parameter`.
+
+        Configuration rather than a field on a rule because it is a property of
+        the *deployment's* queue, not of any one rule: how fast this instance
+        wants to turn queued runs into sessions is one decision, and it is made
+        where every other deployment setting lives (so it can be pinned by a
+        config file or an environment variable). The default is one minute,
+        which is the shortest interval Odoo's cron scheduler supports.
+
+        A value that is missing, not a number, or not positive falls back to the
+        default rather than raising: a bad setting must not stop the queue
+        draining, and the cron's own schedule is not the place to report a
+        configuration error nobody would see.
+        """
+        raw = self.env["ir.config_parameter"].sudo().get_param(
+            DRAIN_INTERVAL_PARAM
+        )
+        try:
+            minutes = int(str(raw).strip()) if raw not in (None, "") else 0
+        except (TypeError, ValueError):
+            minutes = 0
+        if minutes <= 0:
+            return DRAIN_INTERVAL_MINUTES
+        return minutes
+
+    @api.model
+    def _sync_drain_interval(self):
+        """Push the configured interval onto the cron row.
+
+        `ir.config_parameter` is the setting; `ir.cron.interval_number` is what
+        the scheduler actually reads. Writing the parameter alone would change
+        nothing until somebody edited the cron by hand, which is a setting that
+        quietly does nothing. So the value is mirrored onto the cron row here —
+        at install/upgrade (the data file calls it) and whenever the settings
+        form is saved.
+
+        Returns the interval it wrote, in minutes.
+        """
+        minutes = self._drain_interval_minutes()
+        cron = self.env.ref(DRAIN_CRON_XMLID, raise_if_not_found=False)
+        if not cron:
+            # Installing, before the data file that creates it has run.
+            return minutes
+        cron.sudo().write({"interval_number": minutes, "interval_type": "minutes"})
+        return minutes
 
     # -- text hygiene -------------------------------------------------------
 

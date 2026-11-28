@@ -27,6 +27,29 @@ class ResConfigSettings(models.TransientModel):
              "off hides what the agent actually did, which makes approvals harder "
              "to judge.",
     )
+    turnstone_drain_interval_minutes = fields.Integer(
+        string="Run Queue Interval",
+        default=1,
+        config_parameter="turnstone_integration.drain_interval_minutes",
+        help="How often queued automation runs are picked up and launched, in "
+             "minutes. A trigger adapter only queues a run; the cron does the "
+             "launching, so this is the delay between an event and the agent "
+             "starting on it.\n\n"
+             "Lower is more responsive and more cron wakeups. 1 is the shortest "
+             "interval Odoo's scheduler supports.",
+    )
+
+    def set_values(self):
+        """Push the drain interval onto its cron row after the settings are saved.
+
+        `ir.config_parameter` is where the value is stored, but `ir.cron`'s own
+        `interval_number` is what the scheduler reads. Writing the parameter
+        alone would change nothing until somebody edited the cron by hand — a
+        setting that quietly does nothing — so the two are kept in step here.
+        """
+        result = super().set_values()
+        self.env["turnstone.automation.run"]._sync_drain_interval()
+        return result
 
     def action_open_turnstone_connections(self):
         return {

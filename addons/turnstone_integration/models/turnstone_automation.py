@@ -317,6 +317,41 @@ class TurnstoneAutomation(models.Model):
              "event's own idempotency key, whatever this is set to.",
     )
 
+    # -- the time-based trigger (#5754) ------------------------------------
+    #
+    # Three fields, and they are all on the rule because that is where a
+    # schedule belongs: "which records, judged by which date, every how long"
+    # is configuration an administrator writes, exactly like the domain and the
+    # prompt. The adapter that reads them is `turnstone.trigger.schedule`.
+    schedule_date_field = fields.Char(
+        string="Due By",
+        help="The date or datetime field of the target model that decides when a "
+             "record is due — for example 'date_deadline' on a task, or "
+             "'write_date' for 'idle for three days'.\n\n"
+             "A record is due when that field is at or before the point the rule "
+             "fires at. Leave it empty and there is nothing to select records "
+             "by, so the schedule fires nothing rather than firing on every "
+             "record.",
+    )
+    schedule_interval_minutes = fields.Integer(
+        string="Every (minutes)", default=0,
+        help="How often this rule may fire for the same record. A record fires "
+             "at most once per window: the cron may run every minute, and a "
+             "record that stays due stays fired-for until the next window.\n\n"
+             "0 means no window, so a due record fires once and is never "
+             "re-fired by this rule — which is the right setting for "
+             "'something becomes due', and the wrong one for 'remind me until "
+             "it is done'.",
+    )
+    schedule_limit = fields.Integer(
+        string="At Most (records)", default=50,
+        help="The most records one tick of this rule will fire for. A due-date "
+             "field on a busy model can select thousands of rows, and each one "
+             "is an agent session; this is the ceiling that stops one rule from "
+             "becoming an outage. Records over the ceiling are left for the "
+             "next tick, not dropped.",
+    )
+
     # -- counters -----------------------------------------------------------
     run_count = fields.Integer(readonly=True, copy=False, default=0)
     last_run_at = fields.Datetime(readonly=True, copy=False)
@@ -416,6 +451,59 @@ class TurnstoneAutomation(models.Model):
         self.ensure_one()
         labels = dict(self._fields["trigger_type"]._description_selection(self.env))
         return labels.get(self.trigger_type, "") or ""
+
+    @api.constrains("schedule_date_field", "schedule_interval_minutes",
+                    "target_model_id")
+    def _check_schedule_fields(self):
+        """Refuse a schedule that could never select anything, at save time.
+
+        A typo in a field name is the ordinary way this goes wrong, and the
+        failure it produces otherwise is a cron that fires nothing, forever,
+        with no explanation anywhere a person would look. Checking it here puts
+        the error where the person who typed it is still looking: at the form.
+
+        The fields are checked on every rule, not only on `schedule` ones,
+        because they are not cleared when a rule stops being a schedule and a
+        negative window is wrong whatever the trigger is.
+        """
+        for rec in self:
+            if rec.schedule_interval_minutes < 0:
+                raise ValidationError(_(
+                    "%(name)s has a negative schedule window. Use 0 for \"fire "
+                    "once and never again\".",
+                ) % {"name": rec.name})
+            if rec.trigger_type != "schedule":
+                continue
+            field_name = (rec.schedule_date_field or "").strip()
+            if not field_name:
+                # Allowed: a schedule with no date field selects nothing, which
+                # the adapter reports rather than guessing at a field.
+                continue
+            if not rec.target_model_id:
+                raise ValidationError(_(
+                    "%(name)s has a schedule date field but no target model, so "
+                    "there is no record to read it from.",
+                ) % {"name": rec.name})
+            model = self.env[rec.target_model_id.model]
+            field = model._fields.get(field_name)
+            if field is None:
+                raise ValidationError(_(
+                    "%(name)s fires on %(field)s, which is not a field of "
+                    "%(model)s. Pick a date or datetime field of the model it "
+                    "watches.",
+                ) % {
+                    "name": rec.name, "field": field_name,
+                    "model": rec.target_model_id.name,
+                })
+            if field.type not in ("date", "datetime"):
+                raise ValidationError(_(
+                    "%(name)s fires on %(field)s, but %(model)s keeps it as a "
+                    "%(type)s. A schedule needs a date or datetime field to "
+                    "select due records by.",
+                ) % {
+                    "name": rec.name, "field": field_name,
+                    "model": rec.target_model_id.name, "type": field.type,
+                })
 
     @api.constrains("trigger_type", "target_model_id")
     def _check_target_model(self):

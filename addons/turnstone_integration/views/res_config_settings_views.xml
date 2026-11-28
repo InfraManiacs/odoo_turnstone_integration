@@ -31,6 +31,12 @@
                             <field name="turnstone_poll_interval"/> ms
                         </setting>
                     </block>
+                    <block title="Automations" name="turnstone_automation_block">
+                        <setting string="Run Queue Interval"
+                                 help="How often queued automation runs are launched, in minutes. This is the delay between an event and the agent starting on it.">
+                            <field name="turnstone_drain_interval_minutes"/> minutes
+                        </setting>
+                    </block>
                 </app>
             </xpath>
         </field>
