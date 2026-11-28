@@ -905,3 +905,137 @@ class TestDetailServerError(MockTurnstoneHttpCase):
                          ["turn 0", "turn 1", "turn 2", "turn 3", "turn 4"])
         self.assertFalse(recovered["session"]["remote_gone"])
         self.assertFalse(recovered["session"]["sync_note"])
+
+@tagged("post_install", "-at_install")
+class TestSidebarListing(MockTurnstoneHttpCase):
+    """The sidebar itself: what a row carries and which rows come back.
+
+    The journeys above prove a transcript survives each way of returning to a
+    chat. This class covers the *listing* half of the same complaint (OTI-5742):
+    a closed chat must still be reachable, and a row must carry enough to tell
+    two sessions of one agent apart. It also pins the access rule, because the
+    listing is the one place a row id arrives from the client as a hint.
+    """
+
+    def _row(self, payload, session_id):
+        rows = [r for r in payload.get("sessions") or [] if r["id"] == session_id]
+        self.assertEqual(len(rows), 1,
+                         "session %s should be listed exactly once" % session_id)
+        return rows[0]
+
+    def test_a_closed_session_stays_in_the_sidebar(self):
+        """AC 2: closing a chat removes it from the live tier, not the list.
+
+        ``action_close`` only closes the remote workstream and sets ``state``;
+        the transcript and the row stay. Dropping it from the listing was the
+        whole reason a closed chat looked deleted, so the row must come back
+        with its state and its count intact.
+        """
+        self.seed_transcript("ws-closed", _transcript(0, 3))
+        chat = self.make_chat("ws-closed", name="Closed chat")
+        self.login()
+        self.open_session(chat.id)
+
+        closed = self.rpc("/turnstone/session/close", session_id=chat.id)
+        self.assertNotIn("error", closed)
+        row = self._row(closed, chat.id)
+        self.assertEqual(row["state"], "closed")
+        self.assertEqual(row["message_count"], 3,
+                         "a closed chat's row still reports its history")
+
+        # And it is still there on the next bootstrap, not only in the answer
+        # to the close call itself.
+        payload = self.bootstrap()
+        self.assertEqual(self._row(payload, chat.id)["state"], "closed")
+
+    def test_a_row_carries_the_agent_and_the_message_count(self):
+        """AC 2: the two fields the client needs to tell same-named rows apart.
+
+        ``agent_id`` is what ``fallbackSession`` matches on; without it the
+        fallback degrades to "newest session at all" and reopens the wrong
+        chat. ``message_count`` separates a never-started draft from a real
+        conversation that happens to share the agent's name.
+        """
+        self.seed_transcript("ws-counted", _transcript(0, 4))
+        used = self.make_chat("ws-counted", name="Used chat")
+        draft = self.make_chat(name="Draft chat")
+        self.login()
+        self.open_session(used.id)
+
+        payload = self.bootstrap()
+        used_row = self._row(payload, used.id)
+        draft_row = self._row(payload, draft.id)
+        self.assertEqual(used_row["agent_id"], self.agent.id)
+        self.assertEqual(used_row["agent_name"], self.agent.name)
+        self.assertEqual(used_row["message_count"], 4)
+        self.assertEqual(draft_row["agent_id"], self.agent.id)
+        self.assertEqual(draft_row["message_count"], 0,
+                         "a draft with no transcript must report zero, not be "
+                         "confused with a used chat")
+        self.assertIsNone(draft_row["ws_id"],
+                          "a draft has no workstream id until its first message")
+
+    def test_rows_are_newest_first(self):
+        """The client's fallback and the sidebar both assume newest-first."""
+        older = self.make_chat(name="Older")
+        newer = self.make_chat(name="Newer")
+        self.login()
+        listed = self.listed_ids(self.bootstrap())
+        self.assertLess(listed.index(newer.id), listed.index(older.id),
+                        "the newest session must come first")
+
+    def test_a_malformed_id_hint_does_not_cost_the_sidebar(self):
+        """A bad ``current_session_id`` must not raise: the whole list is at stake.
+
+        Before OTI-5742 ``int(include_id)`` on junk raised, and the client got
+        an Odoo Server Error instead of a sidebar. The hint is a hint.
+        """
+        chat = self.make_chat(name="Still listed")
+        self.login()
+        for junk in ("not-an-id", None, [chat.id, "junk"], {"a": 1}):
+            payload = self.bootstrap(current_session_id=junk)
+            self.assertNotIn("error", payload,
+                             "hint %r must not break the listing" % (junk,))
+            self.assertIn(chat.id, self.listed_ids(payload))
+
+    def test_another_users_session_cannot_be_pulled_in_by_id(self):
+        """AC 2: the listing never returns another user's session.
+
+        ``include_id`` names a row by id, which is the obvious way to widen
+        visibility. It goes through ``search`` under the caller's record rules,
+        so naming someone else's session returns nothing extra — the same
+        guarantee the transcript cases pin, checked here on the listing path.
+        """
+        theirs = self.make_chat(name="Theirs", user=self.other_user)
+        mine = self.make_chat(name="Mine")
+        self.login()
+        payload = self.bootstrap(current_session_id=theirs.id)
+        self.assertNotIn("error", payload)
+        listed = self.listed_ids(payload)
+        self.assertIn(mine.id, listed)
+        self.assertNotIn(theirs.id, listed,
+                         "another user's session must not be in the sidebar")
+
+    def test_a_closed_session_is_bounded_and_does_not_evict_live_ones(self):
+        """AC 2: closed history is appended, bounded, and cannot evict live work.
+
+        A single window over everything would let a long history of closed
+        chats push the sessions in progress out of the sidebar, which is the
+        original complaint arriving by another route. The closed tier is capped
+        and appended after the open tier.
+        """
+        live = [self.make_chat(name="Live %d" % i) for i in range(3)]
+        closed = [self.make_chat(name="Closed %d" % i) for i in range(25)]
+        self.env["turnstone.session"].browse([c.id for c in closed]).write(
+            {"state": "closed"})
+        self.login()
+
+        payload = self.bootstrap()
+        listed = self.listed_ids(payload)
+        for row in live:
+            self.assertIn(row.id, listed,
+                          "a live session must never be evicted by closed history")
+        self.assertLessEqual(len([i for i in listed if i in [c.id for c in closed]]),
+                             20, "the closed tier is bounded")
+        self.assertTrue(set(listed) & {c.id for c in closed},
+                        "closed sessions are still listed")
