@@ -3,6 +3,7 @@ from . import test_automation_launch
 from . import test_automation_ui
 from . import test_automation_worker
 from . import test_common
+from . import test_queue_drain
 from . import test_send_idempotency
 from . import test_session_create
 from . import test_session_detail_limit
@@ -10,5 +11,6 @@ from . import test_session_persistence
 from . import test_transcript_fetch_limit
 from . import test_trigger_chatter
 from . import test_trigger_record
+from . import test_trigger_schedule
 from . import test_trigger_webhook
 from . import test_trigger_website
