@@ -1065,6 +1065,72 @@ export class TurnstoneChat extends Component {
         return first.length > 110 ? first.slice(0, 110) + "\u2026" : first;
     }
 
+    /**
+     * Why the transcript below is not the whole conversation, or null when it is.
+     *
+     * The server already distinguishes the three states — complete, "kept a
+     * partial transcript" (`sync_note`) and "the workstream is gone"
+     * (`remote_gone`) — but they used to render identically: a short or empty
+     * thread with no explanation, which reads as lost history. The distinction
+     * is only useful if the person reading the thread is told it.
+     *
+     * Deliberately a line of text and not an alert or a dialog. The transcript
+     * still renders and the composer still works; the notice explains what is
+     * on screen, it does not ask anyone to acknowledge anything. It also stays
+     * out of the way when there is nothing wrong — a healthy session returns
+     * null, so a complete transcript renders exactly as it did before.
+     *
+     * `sync_note` is the server's own wording and is already translated there;
+     * `title` is the client's own, so it is an `_t()` term like every other
+     * label in this component.
+     *
+     * `title` is null when the text already says everything. The server's
+     * remote-gone note is a complete sentence ("Turnstone no longer has this
+     * session's workstream (ws-…): it was deleted or expired …"), so a heading
+     * above it would only repeat it. The partial case is different: its note is
+     * the evidence ("returned 200 of 200 rows, not as the beginning …"), and the
+     * headline is the verdict that evidence supports.
+     */
+    get syncNotice() {
+        const session = this.state.session;
+        if (!session) {
+            return null;
+        }
+        const note = (session.sync_note || "").trim();
+        if (session.remote_gone) {
+            // The 404 path writes a note as well, but `remote_gone` is the flag
+            // that can outlive it (a row written before the note existed, a
+            // field cleared by hand), and "the workstream is gone" must never
+            // fall back to silence. So the flag decides, and the note is the
+            // reason when there is one.
+            //
+            // A closed session keeps its transcript across the 404, and then the
+            // server's note — which ends "so the transcript cannot be read any
+            // more" — would sit above a transcript that is plainly readable.
+            // Saying which copy this is resolves that: archived here, not lost.
+            const kept = (session.messages || []).length > 0;
+            const what = kept
+                ? _t("The messages below are Odoo's own copy, kept when the server stopped reporting this session.")
+                : _t("There is no transcript to show: nothing could be read back from the server.");
+            return {
+                kind: "gone",
+                title: note ? null : _t("Turnstone no longer has this session"),
+                text: note ? `${note} ${what}` : what,
+            };
+        }
+        if (note) {
+            // Covers both meanings the server gives this field: a response it
+            // refused to trust (the stored transcript was kept) and one it
+            // applied that may be a window over a longer conversation.
+            return {
+                kind: "partial",
+                title: _t("This transcript may be incomplete"),
+                text: note,
+            };
+        }
+        return null;
+    }
+
     stateBadge(state) {
         return {
             done: "text-bg-light",

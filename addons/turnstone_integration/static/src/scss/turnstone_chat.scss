@@ -53,6 +53,39 @@
         color: var(--bs-warning-text-emphasis, #997404);
     }
 
+    // "This transcript may be missing turns" — a note attached to the thread,
+    // not a failure of it.
+    //
+    // Deliberately not an `alert`: an alert in Odoo's backend reads as
+    // something wrong with the system and demands attention, and there is
+    // nothing to act on here — the transcript below is simply not the whole
+    // story. A left accent rule and muted text say "annotation" while still
+    // being impossible to miss above the first message.
+    .o_ts_sync_notice {
+        flex: 0 0 auto;
+        background-color: var(--bs-tertiary-bg, rgba(0, 0, 0, .04));
+        border-left: 3px solid var(--bs-secondary-color, #6c757d);
+        color: var(--bs-body-color, #212529);
+        // The at-the-limit note is a paragraph, not a phrase. The thread below
+        // is `flex: 1 1 auto; min-height: 0` so it absorbs the height — but a
+        // pathological note should not squeeze the conversation it describes
+        // down to nothing, so cap it against the viewport rather than in fixed
+        // rems. A fixed cap cut the explanation mid-sentence on a phone, which
+        // is the one place the explanation matters most.
+        max-height: 40vh;
+        overflow-y: auto;
+        // A workstream id or a server message can be one unbroken token. Wrap
+        // it rather than let it widen the notice past its own scroll box,
+        // where the text is simply clipped and unreadable.
+        overflow-wrap: anywhere;
+
+        // The workstream is gone: the local copy is all there is. Same
+        // layout, a warmer accent — closer to a consequence than a caveat.
+        &.o_ts_sync_notice_gone {
+            border-left-color: var(--bs-warning, #ffc107);
+        }
+    }
+
     .o_ts_preview {
         white-space: pre-wrap;
         background-color: rgba(0, 0, 0, 0.05);
