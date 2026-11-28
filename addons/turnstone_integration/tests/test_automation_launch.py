@@ -561,6 +561,7 @@ class TestRecordCompanyWall(AutomationLaunchCase):
         rule = self._rule_for_record(suffix="company-same")
 
         run = rule._launch_for_record(partner, idempotency_key="evt-company-same")
+        self._deliver()
 
         self.assertEqual(run.state, "done", run.error)
         self.assertEqual(len(_creates()), 1)
@@ -579,6 +580,7 @@ class TestRecordCompanyWall(AutomationLaunchCase):
                          "the fixture is only meaningful on a model with no company")
 
         run = rule._launch_for_record(country, idempotency_key="evt-no-company")
+        self._deliver()
 
         self.assertEqual(run.state, "done", run.error)
         self.assertEqual(
@@ -593,6 +595,7 @@ class TestRecordCompanyWall(AutomationLaunchCase):
         rule = self._rule_for_record(suffix="company-shared")
 
         run = rule._launch_for_record(partner, idempotency_key="evt-company-shared")
+        self._deliver()
 
         self.assertEqual(run.state, "done", run.error)
         self.assertEqual(len(_creates()), 1)
