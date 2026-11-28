@@ -638,6 +638,11 @@ class TestEmptyRenderRefusal(AutomationLaunchCase):
                       "and what would have happened without the refusal")
         self.assertFalse(run.session_id,
                          "a refused launch creates no session row at all")
+        self.assertEqual(
+            self.env["turnstone.session"].sudo().search_count(
+                [("user_id", "=", self.env.user.id)]), 0,
+            "not even an unlinked one: `_launch_session()` must not have run",
+        )
         self.assertEqual(_creates(), [], "nothing may reach the server")
         self.assertEqual(_mock_workstreams(), [], "no unprompted workstream")
 
