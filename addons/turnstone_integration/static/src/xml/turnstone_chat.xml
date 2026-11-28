@@ -168,6 +168,16 @@
                         <span t-out="this.stateLabel(s.state)"/>
                         <span t-if="s.kind === 'coordinator'" class="badge text-bg-light">coord</span>
                         <span t-if="s.skill" class="text-truncate" t-out="s.skill"/>
+                        <!-- How much conversation the row holds. Two sessions of
+                             one agent share a name, so this is what tells a
+                             never-started draft (0) from a chat with a day of
+                             work in it. Omitted at 0 rather than shown as
+                             "0 messages": a draft's count is the absence of
+                             history, not a fact worth a badge. -->
+                        <span t-if="s.message_count" class="ms-auto text-nowrap"
+                              t-att-title="s.message_count + ' messages'">
+                            <t t-out="s.message_count"/> msg
+                        </span>
                     </div>
                 </div>
             </div>
