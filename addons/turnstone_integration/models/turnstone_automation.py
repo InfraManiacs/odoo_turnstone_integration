@@ -1206,7 +1206,10 @@ class TurnstoneAutomation(models.Model):
 
         Popping the queue is what makes a second call a no-op rather than a
         second delivery. The hook itself does not come through here — it holds
-        the list this transaction armed, which a fresh cursor cannot see.
+        the list this transaction armed, which a fresh cursor cannot see. A
+        commit after this call still runs that hook; by then each run is `done`
+        and `_deliver_queued_run()` leaves it alone, so the second pass is a
+        read and nothing more.
         """
         jobs = self.env.cr.postcommit.data.pop(DELIVERY_JOBS_KEY, None)
         if not jobs:
@@ -1303,8 +1306,9 @@ class TurnstoneAutomation(models.Model):
                 body = rule._queued_run_prompt(run)
             except UserError as exc:
                 # Nothing was sent, so nothing is counted: `failed` with the
-                # attempt count unchanged says "not tried, and why".
-                return self._fail_run(run, exc)
+                # attempt count unchanged says "not tried, and why". Called on
+                # the rule (not `self`, which is an empty recordset here).
+                return rule._fail_run(run, exc)
         if not self._claim_delivery(run_id):
             # Another launcher is delivering the same run right now (the run
             # worker, or a duplicate arm from a second request). It stays queued
