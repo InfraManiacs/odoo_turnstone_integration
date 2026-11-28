@@ -987,7 +987,8 @@ class TurnstoneAutomation(models.Model):
         `run.state` and `run.error`:
 
         * `failed` with `attempt_count == 0` — refused before anything was
-          tried: no permission, no company, a prompt that would not render.
+          tried: no permission, no company, a record of another company, a
+          prompt that would not render.
         * `failed` with an odd count — an attempt was made and did not land.
         * `skipped` — the event arrived and the rule's own window suppressed it.
         * `done` — a session exists and the prompt was delivered to it.
@@ -998,6 +999,18 @@ class TurnstoneAutomation(models.Model):
             default the dedupe token. `webhook` and `manual` rules launch with
             no record; a prompt that uses `{{ }}` then fails, because there is
             nothing to fill it from.
+
+            **The caller owes the record's company.** For a model that carries
+            a `company_id`, the record must belong to this rule's company:
+            a record of another company is refused here as a `failed` run with
+            `attempt_count == 0`, rather than rendering that company's field
+            values into the prompt of a session attributed to this one. A
+            record whose company is empty is *shared* — Odoo's meaning: every
+            company may use the row — and is accepted, as is a model with no
+            `company_id` at all. The trigger adapters filter records through
+            `turnstone.trigger.record._company_ok()` before queueing a run;
+            this check is the service enforcing the same wall so that an
+            adapter is never the only line of defence (OTI-5788).
         ``triggering_user``
             Who caused it, used only when the rule runs as `triggering_user`.
             A cron or a webhook passes nothing and the rule's own run-as setting
@@ -1118,9 +1131,15 @@ class TurnstoneAutomation(models.Model):
         # 4. Who is this for? Refused before a session exists and before any
         #    HTTP, and recorded on the run: a permission problem is exactly what
         #    a person investigating "why did this not fire" needs to see.
+        #    The record's company is checked here too, and after the owner:
+        #    an unauthorized user must not learn anything about the record, and
+        #    this is the one attempt path both `_launch_for_record()` and the
+        #    drain go through, so the wall holds for a caller that skipped the
+        #    adapters' own filter.
         try:
             owner = self._resolve_run_as_user(triggering_user)
             self._check_launch_allowed(owner)
+            self._check_record_company(record)
         except UserError as exc:
             _logger.info("Automation %s refused run %s: %s", self.name, run.id, exc)
             return self._fail_run(run, exc)
@@ -1240,6 +1259,67 @@ class TurnstoneAutomation(models.Model):
             })
         agent._check_user_allowed(owner)
         return True
+
+    def _check_record_company(self, record):
+        """Raise unless `record`'s company is this rule's, when it has one.
+
+        Defence in depth for the company wall (OTI-5788). The trigger adapters
+        filter a record through `turnstone.trigger.record._company_ok()` before
+        they queue a run, but this service is also called directly — by a
+        server action, a workflow, or an adapter written later — and a
+        company-B record handed to a company-A rule renders company-B field
+        values into the prompt of a session attributed inside company A. The
+        run row inherits the rule's company, so nothing downstream would flag
+        it. The caller's obligation is stated in `_launch_for_record()`; this
+        is the service enforcing it instead of trusting it.
+
+        Three cases, and the two permissive ones are deliberate:
+
+        * the model has no `company_id` at all — nothing to compare, so the
+          launch proceeds. `company_id` is Odoo's convention; a model that
+          names its company field something else (or gives the name to a link
+          that is not `res.company`) is treated as carrying none, and an
+          adapter watching such a model applies its own wall.
+        * the record's company is empty — a *shared* record, which in Odoo
+          means every company uses the row (`res.partner.company_id` empty is
+          the standard example). It may supply any company's rule.
+        * the record's company is set — it has to be this rule's company.
+
+        Narrower on purpose than `_company_ok()`: that one also asks whether
+        this environment may see the rule's company, which is a question about
+        the *caller* and belongs to the adapters. The launch service only has
+        to answer "is this record's company the rule's", and asking more here
+        would refuse launches the drain can legitimately make.
+
+        Read with `sudo()`: whether the launching user may read the record is a
+        separate question from whether it may supply this rule's prompt, and a
+        refusal has to be recordable either way. The message names the model
+        and the record's id but never its display name — it is stored on a run
+        row that the rule's company can read, and the point of the check is
+        that the other company's business data does not cross that wall.
+        """
+        self.ensure_one()
+        if record is None or not record:
+            return True
+        field = record._fields.get("company_id")
+        if field is None or field.type != "many2one" \
+                or field.comodel_name != "res.company":
+            return True
+        company = record.sudo().company_id
+        if not company or company.id == self.company_id.id:
+            return True
+        raise UserError(_(
+            "%(rule)s belongs to %(company)s, and the %(model)s record #%(id)s it "
+            "was given belongs to %(record_company)s. A launch can only put a "
+            "record of the rule's own company into its prompt; a record with no "
+            "company at all is shared and is allowed.",
+        ) % {
+            "rule": self.name,
+            "company": self.company_id.display_name,
+            "model": record._name,
+            "id": record.id,
+            "record_company": company.display_name,
+        })
 
     def _create_launch_session(self, owner, record=None):
         """The session row a launch sends its prompt from.

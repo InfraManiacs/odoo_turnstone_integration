@@ -447,6 +447,121 @@ class TestPermissionRefusal(AutomationLaunchCase):
 
 
 @tagged("post_install", "-at_install")
+class TestRecordCompanyWall(AutomationLaunchCase):
+    """A trigger record of another company launches nothing, and says so.
+
+    The adapters filter a record through `turnstone.trigger.record._company_ok()`
+    before queueing a run, so nothing in-tree reaches this today. That is exactly
+    why it is tested at the service: the adapters are the first line of defence,
+    and a service that trusts its caller is one caller away from putting company
+    B's field values into company A's prompt. `_launch_for_record()` is the
+    documented entry point for any module, so the wall belongs here too.
+
+    The two permissive cases are pinned as hard as the refusal: an over-eager
+    check would break every rule watching a model with no `company_id` (a
+    country, a currency, a partner tag) and every rule on a shared record.
+    """
+
+    def _other_company(self, name="Other Co (record wall)"):
+        return self.env["res.company"].create({"name": name})
+
+    def test_a_record_of_another_company_is_refused_before_any_call(self):
+        other = self._other_company()
+        # A company-B partner, named so the assertion can prove the name did not
+        # travel: the run row is company A's, and its error is read by company
+        # A's managers.
+        partner = self.env["res.partner"].create({
+            "name": "Company B Secret Co",
+            "email": "secret@b.example",
+            "company_id": other.id,
+        })
+        rule = self._rule_for_record(suffix="company-wall")
+
+        run = rule._launch_for_record(partner, idempotency_key="evt-company-wall")
+
+        self.assertEqual(run.state, "failed")
+        self.assertEqual(run.attempt_count, 0, "nothing was tried")
+        self.assertIn(other.display_name, run.error,
+                      "the refusal must name the record's company")
+        self.assertIn(self.company.display_name, run.error,
+                      "and the rule's, so the mismatch is legible")
+        self.assertNotIn("Company B Secret Co", run.error,
+                         "the other company's business data must not cross the "
+                         "wall in the explanation either")
+        self.assertFalse(run.session_id, "a refused launch creates no session")
+        self.assertEqual(_creates(), [], "the wall must be hit before any HTTP")
+        self.assertEqual(_mock_workstreams(), [], "nothing on the server")
+
+    def test_a_record_of_the_rules_own_company_still_launches(self):
+        """The control: the check refuses a mismatch, not a stamped record."""
+        partner = self.env["res.partner"].create({
+            "name": "Company A Co",
+            "company_id": self.company.id,
+        })
+        rule = self._rule_for_record(suffix="company-same")
+
+        run = rule._launch_for_record(partner, idempotency_key="evt-company-same")
+
+        self.assertEqual(run.state, "done", run.error)
+        self.assertEqual(len(_creates()), 1)
+
+    def test_a_model_with_no_company_field_is_unaffected(self):
+        """A model that carries no `company_id` has no company to compare."""
+        rule = self._rule_for_record(
+            suffix="no-company-field",
+            target_model_id=self.env["ir.model"]._get("res.country").id,
+            prompt_template="Write a note about {{ name }} ({{ code }}).",
+        )
+        country = self.env["res.country"].create({
+            "name": "Turnstonia", "code": "TS",
+        })
+        self.assertNotIn("company_id", country._fields,
+                         "the fixture is only meaningful on a model with no company")
+
+        run = rule._launch_for_record(country, idempotency_key="evt-no-company")
+
+        self.assertEqual(run.state, "done", run.error)
+        self.assertEqual(
+            _mock_workstreams()[0]["messages"][0]["content"],
+            "Write a note about Turnstonia (TS).",
+        )
+
+    def test_a_shared_record_is_allowed(self):
+        """An empty company on the record means shared, which Odoo allows."""
+        partner = self.env["res.partner"].create({"name": "Shared Contact"})
+        self.assertFalse(partner.company_id, "the fixture's partner is shared")
+        rule = self._rule_for_record(suffix="company-shared")
+
+        run = rule._launch_for_record(partner, idempotency_key="evt-company-shared")
+
+        self.assertEqual(run.state, "done", run.error)
+        self.assertEqual(len(_creates()), 1)
+
+    def test_the_drain_is_covered_too(self):
+        """The check lives in the one attempt path, not only the caller's.
+
+        `_attempt_launch()` is what #5754's drain calls, so a check written into
+        `_launch_for_record()` alone would leave the cron on the old path. This
+        drives the attempt directly, with no launch service in front of it.
+        """
+        other = self._other_company("Other Co (drain wall)")
+        partner = self.env["res.partner"].create({
+            "name": "Drained B Co", "company_id": other.id,
+        })
+        rule = self._rule_for_record(suffix="company-drain")
+        run = self.env["turnstone.automation.run"].sudo()._open_for_event(
+            rule, "evt-drain-company", record=partner,
+        )[0]
+
+        rule._attempt_launch(run, partner, None, "Greet Drained B Co.")
+
+        self.assertEqual(run.state, "failed")
+        self.assertEqual(run.attempt_count, 0)
+        self.assertIn(other.display_name, run.error)
+        self.assertEqual(_creates(), [])
+
+
+@tagged("post_install", "-at_install")
 class TestTransportFailure(AutomationLaunchCase):
     """Criterion 3: a 500 becomes a failed run with the error and no secret."""
 
