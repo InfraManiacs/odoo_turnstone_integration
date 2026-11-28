@@ -6,6 +6,7 @@ from . import turnstone_automation
 from . import turnstone_automation_run
 from . import turnstone_trigger_record
 from . import turnstone_trigger_website
+from . import turnstone_trigger_chatter
 from . import turnstone_trigger_schedule
 from . import turnstone_audit_log
 from . import turnstone_session

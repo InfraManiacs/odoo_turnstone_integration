@@ -9,4 +9,5 @@ from . import test_session_detail_limit
 from . import test_session_persistence
 from . import test_transcript_fetch_limit
 from . import test_trigger_record
+from . import test_trigger_chatter
 from . import test_trigger_website
